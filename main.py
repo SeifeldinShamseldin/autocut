@@ -5,6 +5,7 @@ import os
 import re
 import json
 import platform
+import time as _time
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 import tkinter as tk
@@ -16,6 +17,8 @@ import customtkinter as ctk
 import numpy as np
 
 from pydub import AudioSegment
+
+from PIL import Image, ImageTk
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -65,6 +68,335 @@ def _open_with_system(path: str):
         subprocess.Popen(["xdg-open", path])
 
 
+def _fmt_time(seconds: float) -> str:
+    """Format seconds as M:SS."""
+    s = int(seconds)
+    m = s // 60
+    s = s % 60
+    return f"{m}:{s:02d}"
+
+
+def _parse_drop_paths(data: str) -> list:
+    """Parse tkinterdnd2 drop data handling {path with spaces} format."""
+    paths = []
+    data = data.strip()
+    i = 0
+    while i < len(data):
+        if data[i] == "{":
+            end = data.find("}", i)
+            if end == -1:
+                paths.append(data[i + 1:].strip())
+                break
+            paths.append(data[i + 1:end])
+            i = end + 1
+        else:
+            # find next space or end
+            j = i
+            while j < len(data) and data[j] != " ":
+                j += 1
+            token = data[i:j].strip()
+            if token:
+                paths.append(token)
+            i = j
+        # skip whitespace between tokens
+        while i < len(data) and data[i] == " ":
+            i += 1
+    return [p for p in paths if p]
+
+
+# ── VideoPlayer widget ─────────────────────────────────────────────────────────
+
+class VideoPlayer(ctk.CTkFrame):
+    """Embedded video player widget using ffmpeg raw frame piping + PIL."""
+
+    def __init__(self, master, segments_getter=None, **kwargs):
+        super().__init__(master, fg_color=PRIMARY, corner_radius=12, **kwargs)
+
+        self._path: str | None = None
+        self._duration: float = 0.0
+        self._current_pos: float = 0.0
+        self._playing: bool = False
+        self._stop_event = threading.Event()
+        self._photo = None  # keep reference to prevent GC
+        self._segments_getter = segments_getter
+
+        # ── Canvas (video display) ─────────────────────────────────────────
+        self._canvas = tk.Canvas(self, bg="black", highlightthickness=0)
+        self._canvas.pack(fill="both", expand=True)
+
+        # Placeholder text
+        self._placeholder_id = self._canvas.create_text(
+            160, 100,
+            text="Drop video here\nor click Import",
+            fill="#64748B",
+            font=("", 13),
+            justify="center",
+        )
+
+        # ── Controls bar ──────────────────────────────────────────────────
+        controls = ctk.CTkFrame(self, fg_color="#0F172A", height=40)
+        controls.pack(fill="x", side="bottom")
+        controls.pack_propagate(False)
+
+        self._play_btn = ctk.CTkButton(
+            controls, text="▶", width=32, height=28,
+            corner_radius=6, font=("", 14),
+            fg_color="transparent", hover_color="#1e293b",
+            text_color="#F1F5F9",
+            command=self.toggle_play,
+        )
+        self._play_btn.pack(side="left", padx=(6, 2), pady=4)
+
+        self._scrubber = ctk.CTkSlider(
+            controls, from_=0, to=1,
+            button_color="#0369A1", button_hover_color="#075985",
+            progress_color="#0369A1", fg_color="#334155",
+            command=self._on_scrub,
+        )
+        self._scrubber.set(0)
+        self._scrubber.pack(side="left", fill="x", expand=True, padx=6, pady=8)
+
+        self._time_label = ctk.CTkLabel(
+            controls, text="0:00 / 0:00",
+            font=("", 10), text_color="#94A3B8",
+        )
+        self._time_label.pack(side="left", padx=(2, 8))
+
+    # ── Public API ────────────────────────────────────────────────────────
+
+    def load(self, path: str):
+        """Load a video file and show its first frame."""
+        self.unload()
+        self._path = path
+        self._duration = self._get_duration(path)
+        self._current_pos = 0.0
+        self._scrubber.set(0)
+        self._time_label.configure(text=f"0:00 / {_fmt_time(self._duration)}")
+        # Show first frame in background
+        threading.Thread(target=lambda: self._show_frame(0), daemon=True).start()
+
+    def unload(self):
+        """Stop playback, clear canvas, show placeholder."""
+        self._stop_playback()
+        self._path = None
+        self._duration = 0.0
+        self._current_pos = 0.0
+        self._photo = None
+        self._canvas.delete("all")
+        w = max(self._canvas.winfo_width(), 320)
+        h = max(self._canvas.winfo_height(), 200)
+        self._placeholder_id = self._canvas.create_text(
+            w // 2, h // 2,
+            text="Drop video here\nor click Import",
+            fill="#64748B",
+            font=("", 13),
+            justify="center",
+        )
+        self._play_btn.configure(text="▶")
+        self._scrubber.set(0)
+        self._time_label.configure(text="0:00 / 0:00")
+
+    def toggle_play(self):
+        if not self._path:
+            return
+        if self._playing:
+            self._stop_playback()
+        else:
+            self._start_playback()
+
+    # ── Internal ──────────────────────────────────────────────────────────
+
+    def _get_duration(self, path: str) -> float:
+        try:
+            r = subprocess.run(
+                [FFMPEG, "-i", path],
+                capture_output=True, text=True,
+            )
+            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
+            if m:
+                h, mn, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                return h * 3600 + mn * 60 + s
+        except Exception:
+            pass
+        return 0.0
+
+    def _show_frame(self, pos_s: float):
+        """Render a single frame at pos_s (background thread)."""
+        if not self._path:
+            return
+        try:
+            w = max(self._canvas.winfo_width(), 320)
+            h = max(self._canvas.winfo_height(), 200)
+            cmd = [
+                FFMPEG,
+                "-ss", f"{pos_s:.3f}",
+                "-i", self._path,
+                "-vframes", "1",
+                "-vf", (
+                    f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                    f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
+                ),
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "pipe:1",
+            ]
+            r = subprocess.run(cmd, capture_output=True)
+            if len(r.stdout) >= w * h * 3:
+                img = Image.frombytes("RGB", (w, h), r.stdout[:w * h * 3])
+                photo = ImageTk.PhotoImage(img)
+                self._photo = photo
+                self.after(0, lambda: self._blit(photo, w, h))
+        except Exception:
+            pass
+
+    def _blit(self, photo, w: int, h: int):
+        self._canvas.delete("all")
+        self._canvas.create_image(w // 2, h // 2, image=photo, anchor="center")
+
+    def _start_playback(self):
+        self._stop_event.clear()
+        self._playing = True
+        self._play_btn.configure(text="⏸")
+        threading.Thread(target=self._playback_loop, daemon=True).start()
+
+    def _stop_playback(self):
+        self._stop_event.set()
+        self._playing = False
+        self._play_btn.configure(text="▶")
+
+    def _playback_loop(self):
+        """Play through speech segments at 15 fps (background thread)."""
+        if not self._path:
+            self._playing = False
+            return
+
+        w = max(self._canvas.winfo_width(), 320)
+        h = max(self._canvas.winfo_height(), 200)
+        frame_bytes = w * h * 3
+        fi = 1.0 / 15  # 15 fps
+
+        segs = self._segments_getter() if self._segments_getter else []
+        if not segs:
+            segs = [(0, int(self._duration * 1000))]
+
+        # Find the starting segment index based on current pos
+        start_pos_ms = self._current_pos * 1000
+        seg_start_idx = 0
+        for idx, (s_ms, e_ms) in enumerate(segs):
+            if e_ms > start_pos_ms:
+                seg_start_idx = idx
+                break
+
+        proc = None
+        try:
+            for seg_idx in range(seg_start_idx, len(segs)):
+                if self._stop_event.is_set():
+                    break
+
+                s_ms, e_ms = segs[seg_idx]
+
+                if seg_idx == seg_start_idx:
+                    seg_start_s = max(self._current_pos, s_ms / 1000)
+                else:
+                    seg_start_s = s_ms / 1000
+
+                seg_end_s = e_ms / 1000
+                seg_dur_s = seg_end_s - seg_start_s
+                if seg_dur_s <= 0:
+                    continue
+
+                cmd = [
+                    FFMPEG,
+                    "-ss", f"{seg_start_s:.3f}",
+                    "-i", self._path,
+                    "-t", f"{seg_dur_s:.3f}",
+                    "-vf", (
+                        f"fps=15,scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
+                    ),
+                    "-f", "rawvideo",
+                    "-pix_fmt", "rgb24",
+                    "-an",
+                    "pipe:1",
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+
+                frame_count = 0
+                loop_start = _time.monotonic()
+
+                while not self._stop_event.is_set():
+                    raw = proc.stdout.read(frame_bytes)
+                    if len(raw) < frame_bytes:
+                        break
+
+                    img = Image.frombytes("RGB", (w, h), raw)
+                    photo = ImageTk.PhotoImage(img)
+                    self._photo = photo
+                    self.after(0, lambda p=photo: self._blit(p, w, h))
+
+                    pos = seg_start_s + frame_count * fi
+                    self._current_pos = pos
+                    frac = pos / self._duration if self._duration > 0 else 0
+                    self.after(0, lambda f=frac, t=pos: self._update_ui(f, t))
+
+                    frame_count += 1
+                    elapsed = _time.monotonic() - loop_start
+                    expected = frame_count * fi
+                    sleep_dur = expected - elapsed
+                    if sleep_dur > 0:
+                        _time.sleep(sleep_dur)
+
+                proc.terminate()
+                proc.wait()
+                proc = None
+
+        except Exception:
+            pass
+        finally:
+            if proc is not None:
+                try:
+                    proc.terminate()
+                    proc.wait()
+                except Exception:
+                    pass
+
+        if not self._stop_event.is_set():
+            # Playback finished naturally — reset to beginning
+            self._current_pos = 0.0
+            self.after(0, self._on_ended)
+
+        self._playing = False
+
+    def _update_ui(self, frac: float, pos_s: float):
+        self._scrubber.set(max(0.0, min(1.0, frac)))
+        self._time_label.configure(
+            text=f"{_fmt_time(pos_s)} / {_fmt_time(self._duration)}"
+        )
+
+    def _on_ended(self):
+        self._play_btn.configure(text="▶")
+        self._scrubber.set(0)
+        self._time_label.configure(text=f"0:00 / {_fmt_time(self._duration)}")
+        # Show first frame again
+        if self._path:
+            threading.Thread(target=lambda: self._show_frame(0), daemon=True).start()
+
+    def _on_scrub(self, val):
+        if not self._path or self._duration <= 0:
+            return
+        pos = float(val) * self._duration
+        self._current_pos = pos
+        self._time_label.configure(
+            text=f"{_fmt_time(pos)} / {_fmt_time(self._duration)}"
+        )
+        if not self._playing:
+            threading.Thread(target=lambda: self._show_frame(pos), daemon=True).start()
+
+
 # ── Base class: either TkinterDnD.Tk or ctk.CTk ──────────────────────────────
 if _DND:
     _BaseClass = TkinterDnD.Tk
@@ -82,8 +414,8 @@ class AutoCutApp(_BaseClass):
             ctk.set_default_color_theme("blue")
 
         self.title("AutoCut")
-        self.geometry("1100x780")
-        self.minsize(900, 650)
+        self.geometry("1200x800")
+        self.minsize(950, 650)
         self.configure(fg_color=BG)
 
         # Core state
@@ -111,6 +443,14 @@ class AutoCutApp(_BaseClass):
 
         self._build_ui()
         self._bind_undo_redo()
+
+        # Register drag-and-drop on entire window
+        if _DND:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_drop)
+            # Also register on the video canvas after UI is built
+            self.video_player._canvas.drop_target_register(DND_FILES)
+            self.video_player._canvas.dnd_bind("<<Drop>>", self._on_drop)
 
     # ── UI BUILD ──────────────────────────────────────────────────────────────
 
@@ -182,10 +522,26 @@ class AutoCutApp(_BaseClass):
         self.batch_listbox.pack(fill="x", pady=(4, 0))
         self.batch_listbox.bind("<<ListboxSelect>>", self._on_batch_select)
 
-        # ── Waveform ──────────────────────────────────────────────────────────
-        self.wave_card = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14,
+        # ── Content row: video player (left) + waveform (right) ───────────
+        content_row = ctk.CTkFrame(self, fg_color="transparent")
+        content_row.pack(fill="both", expand=True, padx=20, pady=14)
+
+        # Video card (left)
+        video_card = ctk.CTkFrame(content_row, fg_color=PANEL, corner_radius=14,
+                                  border_width=1, border_color=BORDER, width=500)
+        video_card.pack(side="left", fill="y")
+        video_card.pack_propagate(False)
+
+        self.video_player = VideoPlayer(
+            video_card,
+            segments_getter=lambda: self.segments,
+        )
+        self.video_player.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # Wave card (right)
+        self.wave_card = ctk.CTkFrame(content_row, fg_color=PANEL, corner_radius=14,
                                       border_width=1, border_color=BORDER)
-        self.wave_card.pack(fill="both", expand=True, padx=20, pady=14)
+        self.wave_card.pack(side="left", fill="both", expand=True, padx=(14, 0))
 
         wave_header = ctk.CTkFrame(self.wave_card, fg_color="transparent")
         wave_header.pack(fill="x", padx=16, pady=(12, 0))
@@ -210,7 +566,7 @@ class AutoCutApp(_BaseClass):
 
         self._draw_empty_waveform()
 
-        # Drag-and-drop bindings
+        # Drag-and-drop bindings on waveform
         if _DND:
             self.wave_card.drop_target_register(DND_FILES)
             self.wave_card.dnd_bind("<<Drop>>", self._on_drop)
@@ -342,15 +698,6 @@ class AutoCutApp(_BaseClass):
             command=self.export_clips, state="disabled"
         )
         self.export_clips_btn.pack(side="right", padx=(0, 8), pady=14)
-
-        # Preview button (green)
-        self.preview_btn = ctk.CTkButton(
-            footer, text="▶ Preview", width=110, height=36,
-            corner_radius=8, font=("", 13, "bold"),
-            fg_color="#10B981", hover_color="#059669",
-            command=self._preview, state="disabled"
-        )
-        self.preview_btn.pack(side="right", padx=(0, 8), pady=14)
 
         # Undo/redo buttons
         self.redo_btn = ctk.CTkButton(
@@ -533,7 +880,6 @@ class AutoCutApp(_BaseClass):
         state = "normal" if self.segments else "disabled"
         self.export_btn.configure(state=state)
         self.export_clips_btn.configure(state=state)
-        self.preview_btn.configure(state=state)
         self._draw_waveform()
 
     # ── SILENCE MODE ──────────────────────────────────────────────────────────
@@ -575,7 +921,6 @@ class AutoCutApp(_BaseClass):
     @staticmethod
     def _atempo_chain(speed: float) -> str:
         """Build chained atempo filter string for speeds > 2x."""
-        # atempo supports 0.5–2.0; chain for higher speeds
         filters = []
         remaining = speed
         while remaining > 2.0:
@@ -603,8 +948,9 @@ class AutoCutApp(_BaseClass):
         self.file_label.configure(text=Path(path).name, text_color=TEXT)
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
-        self.preview_btn.configure(state="disabled")
         self.stats_label.configure(text="Loading audio…")
+        # Load into video player
+        self.video_player.load(path)
         threading.Thread(target=self._load_audio, daemon=True).start()
 
     def _load_audio(self):
@@ -634,9 +980,12 @@ class AutoCutApp(_BaseClass):
     # ── DRAG & DROP ───────────────────────────────────────────────────────────
 
     def _on_drop(self, event):
-        path = event.data.strip().strip("{}")
-        if path:
-            self._load_single(path)
+        paths = _parse_drop_paths(event.data)
+        video_exts = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".webm"}
+        for p in paths:
+            if Path(p).suffix.lower() in video_exts:
+                self._load_single(p)
+                return
 
     # ── UNDO / REDO ───────────────────────────────────────────────────────────
 
@@ -786,7 +1135,6 @@ class AutoCutApp(_BaseClass):
             return
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
-        self.preview_btn.configure(state="disabled")
         self._show_progress(True)
         self.stats_label.configure(text="Batch export starting…")
         threading.Thread(target=self._do_batch_export, args=(folder,), daemon=True).start()
@@ -930,33 +1278,6 @@ class AutoCutApp(_BaseClass):
             try: os.rmdir(tmp_dir)
             except: pass
 
-    # ── PREVIEW ───────────────────────────────────────────────────────────────
-
-    def _preview(self):
-        if not self.segments or not self.video_path:
-            return
-        self.preview_btn.configure(state="disabled")
-        self.stats_label.configure(text="Generating preview…")
-        threading.Thread(target=self._do_preview, daemon=True).start()
-
-    def _do_preview(self):
-        try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-            tmp.close()
-            out_path = tmp.name
-
-            # Low quality export
-            all_segs = self._build_all_segments()
-            self._do_export_with_progress(out_path, all_segs, low_quality=True)
-
-            self.after(0, lambda: self.stats_label.configure(text="Opening preview…"))
-            _open_with_system(out_path)
-            self.after(0, lambda: self.preview_btn.configure(state="normal"))
-        except Exception as exc:
-            msg = str(exc)
-            self.after(0, lambda: self.stats_label.configure(text=f"Preview failed: {msg}"))
-            self.after(0, lambda: self.preview_btn.configure(state="normal"))
-
     # ── EXPORT ────────────────────────────────────────────────────────────────
 
     def _get_crf(self) -> int:
@@ -996,7 +1317,6 @@ class AutoCutApp(_BaseClass):
                                    total_s: float, done_s: float,
                                    callback) -> subprocess.CompletedProcess:
         """Run ffmpeg with -progress pipe:1, parse out_time= and call callback(fraction)."""
-        # Insert -progress pipe:1 after the initial 'ffmpeg' call
         idx = 1
         full_cmd = cmd[:idx] + ["-progress", "pipe:1"] + cmd[idx:]
 
@@ -1028,7 +1348,6 @@ class AutoCutApp(_BaseClass):
             return
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
-        self.preview_btn.configure(state="disabled")
         self._show_progress(True)
         self.progress.set(0)
         self.stats_label.configure(text="Exporting clips…")
@@ -1073,7 +1392,6 @@ class AutoCutApp(_BaseClass):
             self.after(0, lambda: self.stats_label.configure(text=f"Export failed: {msg}"))
             self.after(0, lambda: self.export_btn.configure(state="normal"))
             self.after(0, lambda: self.export_clips_btn.configure(state="normal"))
-            self.after(0, lambda: self.preview_btn.configure(state="normal"))
             self.after(0, lambda: self._show_progress(False))
 
     def export_video(self):
@@ -1093,7 +1411,6 @@ class AutoCutApp(_BaseClass):
 
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
-        self.preview_btn.configure(state="disabled")
         self._show_progress(True)
         self.progress.set(0)
         self.stats_label.configure(text="Exporting… this may take a moment")
@@ -1167,9 +1484,6 @@ class AutoCutApp(_BaseClass):
                 )
                 if proc.returncode != 0:
                     # Fallback: run without progress tracking
-                    r = subprocess.run(cmd[: cmd.index("-progress")] if "-progress" in cmd else cmd,
-                                       capture_output=True, text=True)
-                    # Re-run without progress pipe
                     plain_cmd = cmd.copy()
                     r2 = subprocess.run(plain_cmd, capture_output=True, text=True)
                     if r2.returncode != 0:
@@ -1205,7 +1519,6 @@ class AutoCutApp(_BaseClass):
             self.after(0, lambda: self.stats_label.configure(text=f"Export failed: {msg}"))
             self.after(0, lambda: self.export_btn.configure(state="normal"))
             self.after(0, lambda: self.export_clips_btn.configure(state="normal"))
-            self.after(0, lambda: self.preview_btn.configure(state="normal"))
             self.after(0, lambda: self._show_progress(False))
         finally:
             for seg in segment_files:
@@ -1223,7 +1536,6 @@ class AutoCutApp(_BaseClass):
         self.stats_label.configure(text=msg)
         self.export_btn.configure(state="normal")
         self.export_clips_btn.configure(state="normal")
-        self.preview_btn.configure(state="normal")
 
     def _show_progress(self, show: bool):
         if show and not self.progress_shown:
