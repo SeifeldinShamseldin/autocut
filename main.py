@@ -9,12 +9,14 @@ import time as _time
 import queue as _queue
 import shutil
 import sys
+import math
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 import tkinter as tk
 
 import imageio_ffmpeg
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+_FFMPEG_ENCODERS: set[str] | None = None
 
 import customtkinter as ctk
 import numpy as np
@@ -66,6 +68,32 @@ INSTAGRAM_LOGO_ASSET = ("assets", "instagram-logo.png")
 _PREVIEW_W   = 480
 _PREVIEW_H   = 270
 _PREVIEW_FPS = 25
+_WAVE_MAX_POINTS = 1600
+_WAVE_PLAYHEAD_INTERVAL_S = 0.10
+_SEGMENT_INPUT_FAST_MAX_SEGMENTS = 12
+EXPORT_CAPCUT_FAST = "Fast"
+EXPORT_HIGH_QUALITY = "High Quality"
+PADDING_BOTH = "Both"
+PADDING_BEFORE = "Before"
+PADDING_AFTER = "After"
+VOICE_OFF = "Off"
+VOICE_LIGHT = "Light"
+VOICE_STRONG = "Strong"
+
+
+def _ffmpeg_has_encoder(name: str) -> bool:
+    global _FFMPEG_ENCODERS
+    if _FFMPEG_ENCODERS is None:
+        try:
+            r = subprocess.run(
+                [FFMPEG, "-hide_banner", "-encoders"],
+                capture_output=True,
+                text=True,
+            )
+            _FFMPEG_ENCODERS = set(re.findall(r"\s([A-Za-z0-9_]+)\s", r.stdout))
+        except Exception:
+            _FFMPEG_ENCODERS = set()
+    return name in _FFMPEG_ENCODERS
 
 
 def _dot(parent, color: str, label: str) -> ctk.CTkFrame:
@@ -95,6 +123,18 @@ def _fmt_time(seconds: float) -> str:
     s = int(seconds)
     m = s // 60
     s = s % 60
+    return f"{m}:{s:02d}"
+
+
+def _fmt_eta(seconds: float | None) -> str:
+    if seconds is None or seconds < 0:
+        return "--:--"
+    seconds = int(seconds + 0.5)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h:
+        return f"{h}:{m:02d}:{s:02d}"
     return f"{m}:{s:02d}"
 
 
@@ -1067,6 +1107,9 @@ class AutoCutApp(_BaseClass):
         self.wave_env: np.ndarray | None = None
         self._wave_playhead = None
         self._wave_playhead_label = None
+        self._last_playhead_draw = 0.0
+        self._video_info_cache: dict[str, str] = {}
+        self._hdr_cache: dict[str, bool] = {}
 
         # Audio-only preview state
         self._aud_path: str | None = None     # pre-built cut audio WAV
@@ -1078,8 +1121,8 @@ class AutoCutApp(_BaseClass):
         self._aud_tick_job = None
         self._aud_paused_pos: float = 0.0      # position saved on pause
 
-        # Undo/redo history: list of (threshold, min_silence, padding)
-        self._history: list[tuple[float, float, float]] = []
+        # Undo/redo history: list of (threshold, min_silence, padding, padding_side)
+        self._history: list[tuple[float, float, float, str]] = []
         self._history_idx: int = -1
         self._history_updating: bool = False
 
@@ -1213,19 +1256,40 @@ class AutoCutApp(_BaseClass):
 
         inner = ctk.CTkFrame(controls_card, fg_color="transparent")
         inner.pack(fill="x", padx=0, pady=(2, 8))
-        inner.columnconfigure((0, 1, 2, 3), weight=1)
+        inner.columnconfigure((0, 1, 2, 3, 4), weight=1)
 
         self.threshold_var   = ctk.DoubleVar(value=-40)
         self.min_silence_var = ctk.DoubleVar(value=500)
         self.padding_var     = ctk.DoubleVar(value=100)
+        self.padding_side_var = ctk.StringVar(value=PADDING_BOTH)
 
         self._slider_col(inner, 0, "Silence Threshold",  self.threshold_var,  -70, -10, "{:.0f} dB")
         self._slider_col(inner, 1, "Min Silence Length", self.min_silence_var, 100, 3000, "{:.0f} ms")
         self._slider_col(inner, 2, "Padding",            self.padding_var,    0,   600,  "{:.0f} ms")
 
+        padding_side_frame = ctk.CTkFrame(inner, fg_color="transparent")
+        padding_side_frame.grid(row=0, column=3, sticky="ew", padx=(0, 20))
+        ctk.CTkLabel(padding_side_frame, text="Padding Side", font=("", 11, "bold"),
+                     text_color=TEXT).pack(anchor="w")
+        ctk.CTkLabel(padding_side_frame, text=" ", font=("", 12), text_color=ACCENT).pack(anchor="w", pady=(1, 4))
+        self.padding_side_btn = ctk.CTkSegmentedButton(
+            padding_side_frame,
+            values=[PADDING_BOTH, PADDING_BEFORE, PADDING_AFTER],
+            variable=self.padding_side_var,
+            command=self._on_padding_side_change,
+            font=("", 12),
+            selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER,
+            unselected_color=SOFT,
+            unselected_hover_color=SOFT_HOVER,
+            text_color=TEXT,
+            text_color_disabled=MUTED,
+        )
+        self.padding_side_btn.pack(fill="x")
+
         # Silence mode column
         mode_frame = ctk.CTkFrame(inner, fg_color="transparent")
-        mode_frame.grid(row=0, column=3, sticky="ew", padx=(0, 0))
+        mode_frame.grid(row=0, column=4, sticky="ew", padx=(0, 0))
         ctk.CTkLabel(mode_frame, text="Silence Mode", font=("", 11, "bold"),
                      text_color=TEXT).pack(anchor="w")
         ctk.CTkLabel(mode_frame, text=" ", font=("", 12), text_color=ACCENT).pack(anchor="w", pady=(1, 4))
@@ -1260,15 +1324,27 @@ class AutoCutApp(_BaseClass):
             dropdown_fg_color=PANEL, dropdown_text_color=TEXT,
         ).pack(side="left", padx=(4, 14))
 
-        ctk.CTkLabel(settings_row, text="Quality:", font=("", 11), text_color=MUTED).pack(side="left")
-        self.quality_var = ctk.StringVar(value="High CRF18")
+        ctk.CTkLabel(settings_row, text="Mode:", font=("", 11), text_color=MUTED).pack(side="left")
+        self.export_speed_var = ctk.StringVar(value=EXPORT_CAPCUT_FAST)
         ctk.CTkOptionMenu(
-            settings_row, variable=self.quality_var,
-            values=["High CRF18", "Medium CRF23", "Low CRF28"],
-            width=130, height=28, font=("", 11),
+            settings_row, variable=self.export_speed_var,
+            values=[EXPORT_CAPCUT_FAST, EXPORT_HIGH_QUALITY],
+            width=135, height=28, font=("", 11),
             fg_color=SOFT, text_color=TEXT,
             button_color=SOFT, button_hover_color=SOFT_HOVER,
             dropdown_fg_color=PANEL, dropdown_text_color=TEXT,
+        ).pack(side="left", padx=(4, 20))
+
+        ctk.CTkLabel(settings_row, text="Voice:", font=("", 11), text_color=MUTED).pack(side="left")
+        self.voice_isolation_var = ctk.StringVar(value=VOICE_OFF)
+        ctk.CTkOptionMenu(
+            settings_row, variable=self.voice_isolation_var,
+            values=[VOICE_OFF, VOICE_LIGHT, VOICE_STRONG],
+            width=95, height=28, font=("", 11),
+            fg_color=SOFT, text_color=TEXT,
+            button_color=SOFT, button_hover_color=SOFT_HOVER,
+            dropdown_fg_color=PANEL, dropdown_text_color=TEXT,
+            command=self._on_voice_isolation_change,
         ).pack(side="left", padx=(4, 20))
 
         ctk.CTkLabel(settings_row, text="Preset:", font=("", 11), text_color=MUTED).pack(side="left")
@@ -1312,6 +1388,9 @@ class AutoCutApp(_BaseClass):
                                            progress_color=ACCENT)
         self.progress.set(0)
         self.progress_shown = False
+        self._export_progress_started_at = 0.0
+        self._last_export_progress_update = 0.0
+        self._export_progress_prefix = "Exporting"
 
         # Export as One (rightmost)
         self.export_btn = ctk.CTkButton(
@@ -1456,9 +1535,33 @@ class AutoCutApp(_BaseClass):
         self.ax.set_yticks([])
         for sp in self.ax.spines.values():
             sp.set_edgecolor(BORDER)
-        self.canvas.draw()
+        self.canvas.draw_idle()
         self._wave_playhead = None
         self._wave_playhead_label = None
+
+    def _waveform_display_data(self) -> tuple[np.ndarray, np.ndarray]:
+        xs = self.wave_xs
+        env = self.wave_env
+        if xs is None or env is None:
+            return np.array([]), np.array([])
+
+        widget_w = 0
+        try:
+            widget_w = self.wave_widget.winfo_width()
+        except Exception:
+            pass
+        budget = max(400, min(_WAVE_MAX_POINTS, widget_w * 2 if widget_w else _WAVE_MAX_POINTS))
+        if len(xs) <= budget:
+            return xs, env
+
+        step = max(1, math.ceil(len(xs) / budget))
+        usable = (len(xs) // step) * step
+        if usable <= 0:
+            return xs, env
+
+        xs2 = xs[:usable].reshape(-1, step).mean(axis=1)
+        env2 = env[:usable].reshape(-1, step).max(axis=1)
+        return xs2, env2
 
     def _draw_waveform(self):
         if self.wave_xs is None:
@@ -1467,31 +1570,38 @@ class AutoCutApp(_BaseClass):
         self.ax.set_facecolor(WAVE_BG)
         self.fig.patch.set_facecolor(WAVE_BG)
 
-        xs      = self.wave_xs
-        env     = self.wave_env
+        xs, env = self._waveform_display_data()
         total_s = self.duration_ms / 1000
 
-        self.ax.axvspan(0, total_s, color=REMOVE, alpha=0.10, linewidth=0)
-        for s_ms, e_ms in self.segments:
-            self.ax.axvspan(s_ms / 1000, e_ms / 1000, color=KEEP, alpha=0.10, linewidth=0)
+        self.ax.axvspan(0, total_s, color=REMOVE, alpha=0.08, linewidth=0)
+        keep_bars = [(s_ms / 1000, (e_ms - s_ms) / 1000) for s_ms, e_ms in self.segments]
+        if keep_bars:
+            self.ax.broken_barh(
+                keep_bars, (-1.15, 2.30),
+                facecolors=KEEP,
+                alpha=0.14,
+                linewidth=0,
+            )
+            self.ax.broken_barh(
+                keep_bars, (1.02, 0.08),
+                facecolors=KEEP,
+                alpha=0.75,
+                linewidth=0,
+            )
 
-        self.ax.fill_between(xs, -env, env, color="#CBD5E1", alpha=1.0, linewidth=0)
-        for s_ms, e_ms in self.segments:
-            mask = (xs >= s_ms / 1000) & (xs <= e_ms / 1000)
-            if mask.any():
-                self.ax.fill_between(xs, -env, env, where=mask,
-                                     color=KEEP, alpha=0.85, linewidth=0)
+        if len(xs):
+            self.ax.fill_between(xs, -env, env, color="#94A3B8", alpha=0.85, linewidth=0)
 
-        self.ax.yaxis.grid(True, color=BORDER, linewidth=0.5, alpha=0.6)
         self.ax.set_axisbelow(True)
         self.ax.set_xlim(0, total_s)
         self.ax.set_ylim(-1.15, 1.15)
         self.ax.set_xlabel("seconds", color=MUTED, fontsize=8)
+        self.ax.set_yticks([])
         self.ax.tick_params(colors=MUTED, labelsize=7)
         for sp in self.ax.spines.values():
             sp.set_edgecolor(BORDER)
         self.fig.tight_layout(pad=1.4)
-        self.canvas.draw()
+        self.canvas.draw_idle()
         self._wave_playhead = None
         self._wave_playhead_label = None
 
@@ -1545,7 +1655,7 @@ class AutoCutApp(_BaseClass):
     def _debounced_update(self):
         if self._debounce_id:
             self.after_cancel(self._debounce_id)
-        self._debounce_id = self.after(80, self._on_params_changed)
+        self._debounce_id = self.after(160, self._on_params_changed)
 
     def _on_params_changed(self):
         """Called when sliders change. Push undo history then analyze."""
@@ -1580,7 +1690,8 @@ class AutoCutApp(_BaseClass):
                                       duration_ms: int,
                                       threshold: float,
                                       min_sil_ms: int,
-                                      pad_ms: int) -> list[tuple[int, int]]:
+                                      pad_ms: int,
+                                      padding_side: str = PADDING_BOTH) -> list[tuple[int, int]]:
         """Pure computation, no UI updates. Returns list of (start_ms, end_ms)."""
         is_speech = energy_db > threshold
 
@@ -1605,9 +1716,11 @@ class AutoCutApp(_BaseClass):
                 merged.append([s, e])
 
         result: list[tuple[int, int]] = []
+        pad_before = pad_ms if padding_side in (PADDING_BOTH, PADDING_BEFORE) else 0
+        pad_after = pad_ms if padding_side in (PADDING_BOTH, PADDING_AFTER) else 0
         for s, e in merged:
-            s = max(0, s - pad_ms)
-            e = min(duration_ms, e + pad_ms)
+            s = max(0, s - pad_before)
+            e = min(duration_ms, e + pad_after)
             if result and s <= result[-1][1]:
                 result[-1] = (result[-1][0], max(result[-1][1], e))
             else:
@@ -1622,9 +1735,10 @@ class AutoCutApp(_BaseClass):
         threshold  = self.threshold_var.get()
         min_sil_ms = int(self.min_silence_var.get())
         pad_ms     = int(self.padding_var.get())
+        padding_side = self.padding_side_var.get()
 
         self.segments = self._compute_segments_from_energy(
-            self.energy_db, self.duration_ms, threshold, min_sil_ms, pad_ms
+            self.energy_db, self.duration_ms, threshold, min_sil_ms, pad_ms, padding_side
         )
 
         kept_ms    = sum(e - s for s, e in self.segments)
@@ -1646,9 +1760,27 @@ class AutoCutApp(_BaseClass):
 
     # ── SILENCE MODE ──────────────────────────────────────────────────────────
 
+    def _on_padding_side_change(self, value):
+        if self.energy_db is not None:
+            if not self._history_updating:
+                self._push_history()
+            self._analyze_and_draw()
+
     def _on_silence_mode_change(self, value):
         if self.energy_db is not None:
             self._analyze_and_draw()
+
+    def _on_voice_isolation_change(self, value):
+        self._aud_stop()
+        if self._aud_path:
+            try:
+                os.unlink(self._aud_path)
+            except Exception:
+                pass
+        self._aud_path = None
+        self._aud_paused_pos = 0.0
+        if self.segments:
+            self.preview_btn.configure(text="▶  Play", state="normal")
 
     def _get_silence_speed(self) -> float | None:
         """Returns None for Cut mode, or the speed multiplier."""
@@ -1711,6 +1843,8 @@ class AutoCutApp(_BaseClass):
 
     def _load_single(self, path: str):
         self.video_path = path
+        self._video_info_cache.clear()
+        self._hdr_cache.clear()
         self.file_label.configure(text=Path(path).name, text_color=TEXT)
         self.remove_video_btn.configure(state="normal")
         self.export_btn.configure(state="disabled")
@@ -1724,6 +1858,8 @@ class AutoCutApp(_BaseClass):
 
     def remove_video(self):
         self.video_path = None
+        self._video_info_cache.clear()
+        self._hdr_cache.clear()
         self.audio = None
         self.duration_ms = 0
         self.segments = []
@@ -1823,6 +1959,7 @@ class AutoCutApp(_BaseClass):
             self.threshold_var.get(),
             self.min_silence_var.get(),
             self.padding_var.get(),
+            self.padding_side_var.get(),
         )
         # Truncate forward history
         self._history = self._history[: self._history_idx + 1]
@@ -1832,10 +1969,13 @@ class AutoCutApp(_BaseClass):
 
     def _apply_history(self, idx: int):
         self._history_updating = True
-        t, m, p = self._history[idx]
+        state = self._history[idx]
+        t, m, p = state[:3]
+        padding_side = state[3] if len(state) > 3 else PADDING_BOTH
         self.threshold_var.set(t)
         self.min_silence_var.set(m)
         self.padding_var.set(p)
+        self.padding_side_var.set(padding_side)
         self._history_updating = False
         self._analyze_and_draw()
 
@@ -1887,6 +2027,7 @@ class AutoCutApp(_BaseClass):
             "threshold":   self.threshold_var.get(),
             "min_silence": self.min_silence_var.get(),
             "padding":     self.padding_var.get(),
+            "padding_side": self.padding_side_var.get(),
         }
         self._save_presets_to_disk()
         self._refresh_preset_menu()
@@ -1900,6 +2041,7 @@ class AutoCutApp(_BaseClass):
         self.threshold_var.set(p.get("threshold", -40))
         self.min_silence_var.set(p.get("min_silence", 500))
         self.padding_var.set(p.get("padding", 100))
+        self.padding_side_var.set(p.get("padding_side", PADDING_BOTH))
         self._history_updating = False
         self._push_history()
         self._analyze_and_draw()
@@ -1915,40 +2057,192 @@ class AutoCutApp(_BaseClass):
     # ── EXPORT ────────────────────────────────────────────────────────────────
 
     def _get_crf(self) -> int:
-        q = self.quality_var.get()
-        if "18" in q:
-            return 18
-        elif "23" in q:
-            return 23
-        else:
-            return 28
+        return 18 if self._get_export_speed_mode() == EXPORT_HIGH_QUALITY else 23
 
     def _get_extension(self) -> str:
         return self.format_var.get().lower()
+
+    def _get_export_speed_mode(self) -> str:
+        var = getattr(self, "export_speed_var", None)
+        if var is None:
+            return EXPORT_CAPCUT_FAST
+        return var.get()
 
     def _get_video_encoder(self) -> list[str]:
         crf = self._get_crf()
         return self._get_video_encoder_with_crf(crf)
 
     def _get_video_encoder_with_crf(self, crf: int, out_path: str = "") -> list[str]:
-        return ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+        mode = self._get_export_speed_mode()
+        if mode == EXPORT_HIGH_QUALITY:
+            return self._get_cpu_video_encoder_with_crf(crf, "medium")
+
+        gpu_enc = self._get_gpu_video_encoder_with_crf(crf)
+        if gpu_enc:
+            return gpu_enc
+
+        preset = "ultrafast" if mode == EXPORT_CAPCUT_FAST else "veryfast"
+        return self._get_cpu_video_encoder_with_crf(crf, preset)
+
+    def _get_cpu_video_encoder_with_crf(self, crf: int, preset: str = "veryfast") -> list[str]:
+        return ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+
+    def _get_gpu_video_encoder_with_crf(self, crf: int) -> list[str] | None:
+        bitrate_k = self._target_bitrate_kbps(crf)
+        common_rate = [
+            "-b:v", f"{bitrate_k}k",
+            "-maxrate", f"{int(bitrate_k * 1.5)}k",
+            "-bufsize", f"{int(bitrate_k * 2)}k",
+        ]
+
+        system = platform.system()
+        candidates: list[tuple[str, list[str]]] = []
+        if system == "Darwin":
+            candidates.append((
+                "h264_videotoolbox",
+                [
+                    "-c:v", "h264_videotoolbox",
+                    "-profile:v", "high",
+                    *common_rate,
+                    "-allow_sw", "1",
+                    "-realtime", "1",
+                    "-prio_speed", "1",
+                    "-pix_fmt", "yuv420p",
+                ],
+            ))
+        elif system == "Windows":
+            candidates.extend([
+                (
+                    "h264_nvenc",
+                    [
+                        "-c:v", "h264_nvenc",
+                        "-preset", "p1",
+                        "-tune", "ull",
+                        *common_rate,
+                        "-pix_fmt", "yuv420p",
+                    ],
+                ),
+                (
+                    "h264_qsv",
+                    [
+                        "-c:v", "h264_qsv",
+                        "-preset", "veryfast",
+                        *common_rate,
+                        "-pix_fmt", "yuv420p",
+                    ],
+                ),
+                (
+                    "h264_amf",
+                    [
+                        "-c:v", "h264_amf",
+                        "-quality", "speed",
+                        *common_rate,
+                        "-pix_fmt", "yuv420p",
+                    ],
+                ),
+            ])
+        else:
+            candidates.extend([
+                (
+                    "h264_nvenc",
+                    [
+                        "-c:v", "h264_nvenc",
+                        "-preset", "p1",
+                        "-tune", "ull",
+                        *common_rate,
+                        "-pix_fmt", "yuv420p",
+                    ],
+                ),
+                (
+                    "h264_qsv",
+                    [
+                        "-c:v", "h264_qsv",
+                        "-preset", "veryfast",
+                        *common_rate,
+                        "-pix_fmt", "yuv420p",
+                    ],
+                ),
+            ])
+
+        for encoder_name, args in candidates:
+            if _ffmpeg_has_encoder(encoder_name):
+                return args
+        return None
+
+    def _encoder_name_from_args(self, args: list[str]) -> str:
+        for i, arg in enumerate(args):
+            if arg == "-c:v" and i + 1 < len(args):
+                return args[i + 1]
+        return ""
+
+    def _is_gpu_video_encoder(self, args: list[str]) -> bool:
+        return self._encoder_name_from_args(args) in {
+            "h264_videotoolbox", "h264_nvenc", "h264_qsv", "h264_amf"
+        }
+
+    def _video_info_text_for(self, path: str) -> str:
+        if path not in self._video_info_cache:
+            self._video_info_cache[path] = _video_info_text(path)
+        return self._video_info_cache[path]
+
+    def _is_hdr_video_for(self, path: str) -> bool:
+        if path not in self._hdr_cache:
+            text = self._video_info_text_for(path)
+            self._hdr_cache[path] = any(
+                token in text for token in ("bt2020", "smpte2084", "arib-std-b67", "hlg")
+            )
+        return self._hdr_cache[path]
+
+    def _target_bitrate_kbps(self, crf: int) -> int:
+        text = self._video_info_text_for(self.video_path) if self.video_path else ""
+        m = re.search(r"(\d{3,5})x(\d{3,5})", text)
+        if m:
+            width, height = int(m.group(1)), int(m.group(2))
+        else:
+            width, height = 1920, 1080
+
+        fps = self._source_fps(text)
+
+        if crf <= 18:
+            bpp = 0.18
+        elif crf <= 23:
+            bpp = 0.12
+        else:
+            bpp = 0.08
+
+        kbps = int(width * height * fps * bpp / 1000)
+        return max(3000, min(80000, kbps))
+
+    def _source_fps(self, text: str | None = None) -> float:
+        if text is None:
+            text = self._video_info_text_for(self.video_path) if self.video_path else ""
+        fps = 30.0
+        fps_m = re.search(r"(\d+(?:\.\d+)?)\s*fps", text)
+        if not fps_m:
+            fps_m = re.search(r"(\d+(?:\.\d+)?)\s*tbr", text)
+        if fps_m:
+            try:
+                fps = max(1.0, min(120.0, float(fps_m.group(1))))
+            except Exception:
+                fps = 30.0
+        return fps
 
     def _get_video_filter_args(self, path: str) -> list[str]:
-        if _is_hdr_video(path):
+        if self._is_hdr_video_for(path):
             return ["-vf", _hdr_to_sdr_filter()]
         return []
 
     def _get_segment_video_filter(self, speed: float, path: str) -> str:
         filters = [f"setpts={1.0 / speed:.6f}*PTS"]
-        if _is_hdr_video(path):
+        if self._is_hdr_video_for(path):
             filters.append(_hdr_to_sdr_filter())
         return ",".join(filters)
 
     def _get_color_metadata_args(self, path: str) -> list[str]:
-        if _is_hdr_video(path):
+        if self._is_hdr_video_for(path):
             return ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
 
-        text = _video_info_text(path)
+        text = self._video_info_text_for(path)
 
         args: list[str] = []
         if "bt2020nc" in text:
@@ -2016,6 +2310,91 @@ class AutoCutApp(_BaseClass):
         self.export_clips_btn.configure(state=state)
         self.preview_btn.configure(state=state)
 
+    def _get_voice_isolation_mode(self) -> str:
+        var = getattr(self, "voice_isolation_var", None)
+        if var is None:
+            return VOICE_OFF
+        return var.get()
+
+    def _voice_isolation_chain(self) -> str:
+        mode = self._get_voice_isolation_mode()
+        if mode == VOICE_LIGHT:
+            return (
+                "highpass=f=60,"
+                "afftdn=nr=4:nf=-45"
+            )
+        if mode == VOICE_STRONG:
+            return (
+                "highpass=f=75,"
+                "afftdn=nr=8:nf=-40"
+            )
+        return ""
+
+    def _apply_voice_isolation_to_label(self, source_label: str, output_label: str) -> str:
+        chain = self._voice_isolation_chain()
+        if chain:
+            return f"{source_label}{chain}{output_label}"
+        return f"{source_label}anull{output_label}"
+
+    def _get_audio_filter_args(self) -> list[str]:
+        chain = self._voice_isolation_chain()
+        return ["-af", chain] if chain else []
+
+    def _make_export_tmp_dir(self, out_path: str) -> str:
+        """Prefer temp files beside the export, so external drives carry the temp load."""
+        try:
+            out_dir = Path(out_path).expanduser().resolve().parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            return tempfile.mkdtemp(prefix=".autocut_tmp_", dir=str(out_dir))
+        except Exception:
+            return tempfile.mkdtemp(prefix="autocut_")
+
+    def _free_space_for_path(self, path: str) -> int:
+        try:
+            target = Path(path).expanduser().resolve()
+            check_dir = target if target.is_dir() else target.parent
+            usage = shutil.disk_usage(check_dir)
+            return usage.free
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _fmt_bytes(num_bytes: int) -> str:
+        value = float(max(0, num_bytes))
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if value < 1024 or unit == "TB":
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024
+        return f"{value:.1f} TB"
+
+    def _start_export_progress(self, prefix: str = "Exporting"):
+        self._export_progress_started_at = _time.monotonic()
+        self._last_export_progress_update = 0.0
+        self._export_progress_prefix = prefix
+        self._update_export_progress(0.0, prefix, force=True)
+
+    def _update_export_progress(self, fraction: float, prefix: str | None = None,
+                                force: bool = False):
+        now = _time.monotonic()
+        if not force and now - self._last_export_progress_update < 0.2 and fraction < 1.0:
+            return
+
+        fraction = max(0.0, min(1.0, float(fraction)))
+        self._last_export_progress_update = now
+        if prefix is not None:
+            self._export_progress_prefix = prefix
+
+        started = self._export_progress_started_at or now
+        elapsed = max(0.0, now - started)
+        eta = None
+        if fraction > 0.005:
+            eta = elapsed * (1.0 - fraction) / fraction
+
+        self.progress.set(fraction)
+        self.stats_label.configure(
+            text=f"{self._export_progress_prefix} {fraction * 100:.0f}% · ETA {_fmt_eta(eta)}"
+        )
+
     # ── AUDIO PREVIEW ─────────────────────────────────────────────────────────
 
     def preview_cut(self):
@@ -2077,9 +2456,10 @@ class AutoCutApp(_BaseClass):
         if not labels:
             return None
         if len(labels) == 1:
-            filters.append(f"{labels[0]}anull[outa]")
+            filters.append(self._apply_voice_isolation_to_label(labels[0], "[outa]"))
         else:
-            filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[outa]")
+            filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[acat]")
+            filters.append(self._apply_voice_isolation_to_label("[acat]", "[outa]"))
         return ";".join(filters)
 
     def _aud_wav_duration(self, path: str) -> float:
@@ -2135,7 +2515,7 @@ class AutoCutApp(_BaseClass):
         self.preview_btn.configure(text="▶  Play", state="normal" if self.segments else "disabled")
 
     def _aud_tick(self):
-        """Update waveform cursor every 50 ms."""
+        """Update waveform cursor without forcing a full waveform redraw."""
         if not self._aud_playing:
             return
         if self._aud_proc and self._aud_proc.poll() is not None:
@@ -2148,11 +2528,14 @@ class AutoCutApp(_BaseClass):
         elapsed = _time.monotonic() - self._aud_start_mono
         out_pos = min(self._aud_start_pos + elapsed, self._aud_duration)
         src_pos = self._aud_pos_to_source(out_pos)
-        self._set_waveform_playhead(src_pos, out_pos)
+        now = _time.monotonic()
+        if now - self._last_playhead_draw >= _WAVE_PLAYHEAD_INTERVAL_S:
+            self._last_playhead_draw = now
+            self._set_waveform_playhead(src_pos, out_pos)
         self._pos_label.configure(
             text=f"{_fmt_time(out_pos)} / {_fmt_time(self._aud_duration)}"
         )
-        self._aud_tick_job = self.after(50, self._aud_tick)
+        self._aud_tick_job = self.after(80, self._aud_tick)
 
     def _aud_pos_to_source(self, out_pos_s: float) -> float:
         """Map output audio position → source video position."""
@@ -2195,8 +2578,7 @@ class AutoCutApp(_BaseClass):
         self.export_clips_btn.configure(state="disabled")
         self.preview_btn.configure(state="disabled")
         self._show_progress(True)
-        self.progress.set(0)
-        self.stats_label.configure(text="Exporting clips…")
+        self._start_export_progress("Exporting clips")
         threading.Thread(target=self._do_export_clips, args=(folder,), daemon=True).start()
 
     def _do_export_clips(self, folder: str):
@@ -2205,20 +2587,23 @@ class AutoCutApp(_BaseClass):
             rotate = self._get_rotation()
             video_enc = self._get_video_encoder()
             video_filter_args = self._get_video_filter_args(self.video_path)
+            audio_filter_args = self._get_audio_filter_args()
             color_args = self._get_color_metadata_args(self.video_path)
             ext = self._get_extension()
             n = len(self.segments)
-            total_s = self.duration_ms / 1000
+            total_s = sum((e_ms - s_ms) / 1000 for s_ms, e_ms in self.segments)
+            done_s = 0.0
 
             for i, (s_ms, e_ms) in enumerate(self.segments):
                 self.after(0, lambda i=i: self.stats_label.configure(
                     text=f"Exporting clip {i+1}/{n}…"))
                 out_path = os.path.join(folder, f"{stem}_clip_{i+1:03d}.{ext}")
                 seg_dur = (e_ms - s_ms) / 1000
-                done_s  = s_ms / 1000
 
-                def _cb(v, btn=self.progress):
-                    self.after(0, lambda: self.progress.set(v))
+                def _cb(v, i=i):
+                    self.after(0, lambda value=v, idx=i: self._update_export_progress(
+                        value, f"Exporting clip {idx+1}/{n}"
+                    ))
 
                 cmd = [
                     FFMPEG, "-y",
@@ -2226,6 +2611,7 @@ class AutoCutApp(_BaseClass):
                     "-i", self.video_path,
                     "-t", f"{seg_dur:.3f}",
                     *video_filter_args,
+                    *audio_filter_args,
                     *video_enc,
                     *color_args,
                     "-c:a", "aac", "-b:a", "192k",
@@ -2236,6 +2622,7 @@ class AutoCutApp(_BaseClass):
                 proc = self._run_ffmpeg_with_progress(cmd, seg_dur, total_s, done_s, _cb)
                 if proc.returncode != 0:
                     raise RuntimeError(f"ffmpeg failed for clip {i+1}")
+                done_s += seg_dur
 
             self.after(0, lambda: self._export_done(f"Saved {n} clips to folder!"))
         except Exception as exc:
@@ -2263,20 +2650,142 @@ class AutoCutApp(_BaseClass):
         self.export_clips_btn.configure(state="disabled")
         self.preview_btn.configure(state="disabled")
         self._show_progress(True)
-        self.progress.set(0)
-        self.stats_label.configure(text="Exporting… this may take a moment")
+        self._start_export_progress("Exporting")
         all_segs = self._build_all_segments()
         threading.Thread(target=self._do_export_with_progress,
                          args=(out_path, all_segs, False), daemon=True).start()
+
+    def _can_single_pass_cut_export(self, all_segs: list[tuple[int, int, float]]) -> bool:
+        return bool(all_segs) and all(abs(speed - 1.0) < 1e-6 for _, _, speed in all_segs)
+
+    def _cut_select_expr(self, all_segs: list[tuple[int, int, float]]) -> str:
+        ranges = []
+        for s_ms, e_ms, _ in all_segs:
+            if e_ms > s_ms:
+                ranges.append(f"between(t,{s_ms / 1000:.6f},{e_ms / 1000:.6f})")
+        return "+".join(ranges) if ranges else "0"
+
+    def _run_single_pass_cut_export(self, out_path: str,
+                                    all_segs: list[tuple[int, int, float]],
+                                    total_output_s: float, rotate: str,
+                                    video_enc: list[str], color_args: list[str]):
+        self.after(0, lambda: self._update_export_progress(0.0, "Exporting fast", force=True))
+
+        def _cb(v):
+            self.after(0, lambda value=v: self._update_export_progress(value, "Exporting fast"))
+
+        select_expr = self._cut_select_expr(all_segs)
+        fps = self._source_fps()
+        video_chain = f"[0:v]select='{select_expr}',setpts=N/({fps:.6f}*TB)"
+        if self._is_hdr_video_for(self.video_path):
+            video_chain += f",{_hdr_to_sdr_filter()}"
+        video_chain += "[v]"
+        audio_chain = f"[0:a]aselect='{select_expr}',asetpts=N/SR/TB[acut]"
+        audio_out_chain = self._apply_voice_isolation_to_label("[acut]", "[a]")
+
+        cmd = [
+            FFMPEG, "-y",
+            "-i", self.video_path,
+            "-filter_complex", f"{video_chain};{audio_chain};{audio_out_chain}",
+            "-map", "[v]", "-map", "[a]",
+            *video_enc,
+            *color_args,
+            "-c:a", "aac", "-b:a", "192k",
+            "-metadata:s:v:0", f"rotate={rotate}",
+            "-movflags", "+faststart",
+            out_path,
+        ]
+        proc = self._run_ffmpeg_with_progress(
+            cmd, total_output_s, total_output_s, 0.0, _cb
+        )
+        if proc.returncode != 0:
+            raise RuntimeError("single-pass export failed")
+        self.after(0, lambda: self._update_export_progress(1.0, "Exporting fast", force=True))
+
+    def _run_segment_input_cut_export(self, out_path: str,
+                                      all_segs: list[tuple[int, int, float]],
+                                      total_output_s: float, rotate: str,
+                                      video_enc: list[str], color_args: list[str]):
+        """Fast exact cut export: one ffmpeg process, one seeked input per kept segment.
+        This avoids decoding removed parts while keeping audio/video frame-accurate.
+        """
+        valid = [(s_ms, e_ms) for s_ms, e_ms, speed in all_segs
+                 if e_ms > s_ms and abs(speed - 1.0) < 1e-6]
+        if not valid:
+            raise RuntimeError("no valid cut segments")
+        if len(valid) > _SEGMENT_INPUT_FAST_MAX_SEGMENTS:
+            raise RuntimeError("too many segments for fast segment-input export")
+
+        self.after(0, lambda: self._update_export_progress(0.0, "Exporting fast", force=True))
+
+        cmd = [FFMPEG, "-y"]
+        for s_ms, e_ms in valid:
+            cmd.extend([
+                "-ss", f"{s_ms / 1000:.3f}",
+                "-t", f"{(e_ms - s_ms) / 1000:.3f}",
+                "-i", self.video_path,
+            ])
+
+        filters: list[str] = []
+        concat_inputs: list[str] = []
+        for idx in range(len(valid)):
+            filters.append(f"[{idx}:v]setpts=PTS-STARTPTS[v{idx}]")
+            filters.append(f"[{idx}:a]asetpts=PTS-STARTPTS[a{idx}]")
+            concat_inputs.append(f"[v{idx}][a{idx}]")
+
+        filters.append(
+            f"{''.join(concat_inputs)}concat=n={len(valid)}:v=1:a=1[vcat][a]"
+        )
+        if self._is_hdr_video_for(self.video_path):
+            filters.append(f"[vcat]{_hdr_to_sdr_filter()}[v]")
+        else:
+            filters.append("[vcat]null[v]")
+        filters.append(self._apply_voice_isolation_to_label("[a]", "[aout]"))
+
+        def _cb(v):
+            self.after(0, lambda value=v: self._update_export_progress(value, "Exporting fast"))
+
+        cmd.extend([
+            "-filter_complex", ";".join(filters),
+            "-map", "[v]", "-map", "[aout]",
+            *video_enc,
+            *color_args,
+            "-c:a", "aac", "-b:a", "192k",
+            "-metadata:s:v:0", f"rotate={rotate}",
+            "-movflags", "+faststart",
+            out_path,
+        ])
+
+        proc = self._run_ffmpeg_with_progress(
+            cmd, total_output_s, total_output_s, 0.0, _cb
+        )
+        if proc.returncode != 0:
+            raise RuntimeError("segment-input export failed")
+        self.after(0, lambda: self._update_export_progress(1.0, "Exporting fast", force=True))
+
+    def _run_primary_fast_cut_export(self, out_path: str,
+                                     all_segs: list[tuple[int, int, float]],
+                                     total_output_s: float, rotate: str,
+                                     video_enc: list[str], color_args: list[str]):
+        normal_count = sum(
+            1 for s_ms, e_ms, speed in all_segs
+            if e_ms > s_ms and abs(speed - 1.0) < 1e-6
+        )
+        if normal_count <= _SEGMENT_INPUT_FAST_MAX_SEGMENTS:
+            self._run_segment_input_cut_export(
+                out_path, all_segs, total_output_s, rotate, video_enc, color_args
+            )
+            return
+
+        self._run_single_pass_cut_export(
+            out_path, all_segs, total_output_s, rotate, video_enc, color_args
+        )
 
     def _do_export_with_progress(self, out_path: str,
                                   all_segs: list[tuple[int, int, float]],
                                   low_quality: bool = False,
                                   open_after: bool = False,
                                   done_msg: str = "Export complete!"):
-        tmp_dir = tempfile.mkdtemp()
-        segment_files: list[str] = []
-        concat_txt = None
         try:
             if not all_segs:
                 self.after(0, lambda: self.stats_label.configure(text="Nothing to export."))
@@ -2287,110 +2796,84 @@ class AutoCutApp(_BaseClass):
             rotate    = self._get_rotation()
             crf       = 28 if low_quality else self._get_crf()
             video_enc = (["-c:v", "libx264", "-preset", "ultrafast", "-crf", "35", "-pix_fmt", "yuv420p"]
-                         if low_quality else self._get_video_encoder())
+                         if low_quality else self._get_video_encoder_with_crf(crf))
+            cpu_video_enc = self._get_cpu_video_encoder_with_crf(
+                crf, "ultrafast" if self._get_export_speed_mode() == EXPORT_CAPCUT_FAST else "veryfast"
+            )
             color_args = self._get_color_metadata_args(self.video_path)
-            video_filter_args = self._get_video_filter_args(self.video_path)
-            ext       = Path(out_path).suffix.lstrip(".")
-            n         = len(all_segs)
-            total_s   = self.duration_ms / 1000
 
             # Calculate total output duration for accurate progress
             total_output_s = sum((e - s) / speed / 1000 for s, e, speed in all_segs)
-            done_output_s  = 0.0
 
-            for i, (s_ms, e_ms, speed) in enumerate(all_segs):
-                seg_dur_input  = (e_ms - s_ms) / 1000
-                seg_dur_output = seg_dur_input / speed
+            if not low_quality and self._can_single_pass_cut_export(all_segs):
+                try:
+                    self._run_primary_fast_cut_export(
+                        out_path, all_segs, total_output_s, rotate,
+                        video_enc, color_args,
+                    )
+                    if open_after:
+                        self.after(0, lambda p=out_path: _open_with_system(p))
+                    self.after(0, lambda m=done_msg: self._export_done(m))
+                    return
+                except Exception:
+                    if self._is_gpu_video_encoder(video_enc):
+                        try:
+                            self.after(0, lambda: self.stats_label.configure(
+                                text="GPU export retrying on CPU…"
+                            ))
+                            self._run_primary_fast_cut_export(
+                                out_path, all_segs, total_output_s, rotate,
+                                cpu_video_enc, color_args,
+                            )
+                            if open_after:
+                                self.after(0, lambda p=out_path: _open_with_system(p))
+                            self.after(0, lambda m=done_msg: self._export_done(m))
+                            return
+                        except Exception:
+                            pass
+                    try:
+                        self.after(0, lambda: self.stats_label.configure(
+                            text="Fast export retrying compatibility path…"
+                        ))
+                        self._run_single_pass_cut_export(
+                            out_path, all_segs, total_output_s, rotate,
+                            video_enc, color_args,
+                        )
+                        if open_after:
+                            self.after(0, lambda p=out_path: _open_with_system(p))
+                        self.after(0, lambda m=done_msg: self._export_done(m))
+                        return
+                    except Exception:
+                        if self._is_gpu_video_encoder(video_enc):
+                            try:
+                                self.after(0, lambda: self.stats_label.configure(
+                                    text="Compatibility path retrying on CPU…"
+                                ))
+                                self._run_single_pass_cut_export(
+                                    out_path, all_segs, total_output_s, rotate,
+                                    cpu_video_enc, color_args,
+                                )
+                                if open_after:
+                                    self.after(0, lambda p=out_path: _open_with_system(p))
+                                self.after(0, lambda m=done_msg: self._export_done(m))
+                                return
+                            except Exception:
+                                pass
 
-                seg = os.path.join(tmp_dir, f"seg_{i:04d}.mp4")
-
-                if speed == 1.0:
-                    cmd = [
-                        FFMPEG, "-y",
-                        "-ss", f"{s_ms/1000:.3f}",
-                        "-i", self.video_path,
-                        "-t", f"{seg_dur_input:.3f}",
-                        *video_filter_args,
-                        *video_enc,
-                        *color_args,
-                        "-c:a", "aac", "-b:a", "192k",
-                        seg,
-                    ]
-                else:
-                    # Speed up silence: setpts for video, atempo chain for audio
-                    atempo = self._atempo_chain(speed)
-                    cmd = [
-                        FFMPEG, "-y",
-                        "-ss", f"{s_ms/1000:.3f}",
-                        "-i", self.video_path,
-                        "-t", f"{seg_dur_input:.3f}",
-                        "-filter_complex",
-                        f"[0:v]{self._get_segment_video_filter(speed, self.video_path)}[v];[0:a]{atempo}[a]",
-                        "-map", "[v]", "-map", "[a]",
-                        *video_enc,
-                        *color_args,
-                        "-c:a", "aac", "-b:a", "192k",
-                        seg,
-                    ]
-
-                captured_done = done_output_s
-
-                def _cb(v, d=captured_done, dur=seg_dur_output):
-                    self.after(0, lambda: self.progress.set(v))
-
-                proc = self._run_ffmpeg_with_progress(
-                    cmd, seg_dur_output, total_output_s, done_output_s, _cb
+                raise RuntimeError(
+                    "Fast export failed before completion. AutoCut did not create "
+                    "temporary clip files. Try High Quality, reduce clip count, or send the error text."
                 )
-                if proc.returncode != 0:
-                    # Fallback: run without progress tracking
-                    plain_cmd = cmd.copy()
-                    r2 = subprocess.run(plain_cmd, capture_output=True, text=True)
-                    if r2.returncode != 0:
-                        raise RuntimeError(r2.stderr[-400:])
 
-                segment_files.append(seg)
-                done_output_s += seg_dur_output
-
-            if len(segment_files) == 1:
-                r = subprocess.run([
-                    FFMPEG, "-y", "-i", segment_files[0],
-                    "-c", "copy", "-metadata:s:v:0", f"rotate={rotate}",
-                    "-movflags", "+faststart",
-                    out_path,
-                ], capture_output=True, text=True)
-            else:
-                concat_txt = os.path.join(tmp_dir, "concat.txt")
-                with open(concat_txt, "w") as f:
-                    for seg in segment_files:
-                        f.write(f"file '{seg}'\n")
-                r = subprocess.run([
-                    FFMPEG, "-y",
-                    "-f", "concat", "-safe", "0", "-i", concat_txt,
-                    "-c", "copy", "-metadata:s:v:0", f"rotate={rotate}",
-                    "-movflags", "+faststart",
-                    out_path,
-                ], capture_output=True, text=True)
-
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr[-400:])
-
-            if open_after:
-                self.after(0, lambda p=out_path: _open_with_system(p))
-            self.after(0, lambda m=done_msg: self._export_done(m))
+            raise RuntimeError(
+                "This export mode would need disk-heavy temporary clip files, so it was stopped. "
+                "Use Silence Mode: Cut with Mode: Fast, or export clips separately."
+            )
         except Exception as exc:
             msg = str(exc)
             self.after(0, lambda: self.stats_label.configure(text=f"Export failed: {msg}"))
             self.after(0, self._restore_action_buttons)
             self.after(0, lambda: self._show_progress(False))
-        finally:
-            for seg in segment_files:
-                try: os.unlink(seg)
-                except: pass
-            if concat_txt:
-                try: os.unlink(concat_txt)
-                except: pass
-            try: os.rmdir(tmp_dir)
-            except: pass
 
     def _export_done(self, msg="Export complete!"):
         self._show_progress(False)
