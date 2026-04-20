@@ -53,6 +53,8 @@ WAVE     = "#0F172A"
 WAVE_BG  = "#F8FAFC"
 
 PRESETS_FILE = Path.home() / ".autocut_presets.json"
+SUPPORT_HANDLE = "seifeldin.shamseldin"
+SUPPORT_INSTAGRAM_URL = "https://www.instagram.com/seifeldin.shamseldin/"
 
 # Preview playback settings
 _PREVIEW_W   = 480
@@ -1123,8 +1125,26 @@ class AutoCutApp(_BaseClass):
                                        font=("", 12), text_color=MUTED)
         self.file_label.pack(side="right", padx=4)
 
+        self.tab_view = ctk.CTkTabview(
+            self,
+            fg_color="transparent",
+            segmented_button_selected_color=ACCENT,
+            segmented_button_selected_hover_color="#075985",
+            segmented_button_unselected_color=BORDER,
+            segmented_button_unselected_hover_color="#CBD5E1",
+            text_color=TEXT,
+        )
+        self.tab_view.pack(fill="both", expand=True, padx=20, pady=(12, 18))
+        self.editor_tab = self.tab_view.add("Editor")
+        self.support_tab = self.tab_view.add("Support")
+        self.tab_view.set("Editor")
+        self.editor_tab.configure(fg_color="transparent")
+        self.support_tab.configure(fg_color="transparent")
+
+        self._build_support_tab(self.support_tab)
+
         # ── Batch file list (hidden until batch active) ────────────────────
-        self.batch_frame = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14,
+        self.batch_frame = ctk.CTkFrame(self.editor_tab, fg_color=PANEL, corner_radius=14,
                                         border_width=1, border_color=BORDER)
         # Not packed yet — shown only when batch_files is non-empty
 
@@ -1161,8 +1181,9 @@ class AutoCutApp(_BaseClass):
         self.batch_listbox.bind("<<ListboxSelect>>", self._on_batch_select)
 
         # ── Content row: waveform (full width) ────────────────────────────
-        content_row = ctk.CTkFrame(self, fg_color="transparent")
-        content_row.pack(fill="both", expand=True, padx=20, pady=14)
+        self.content_row = ctk.CTkFrame(self.editor_tab, fg_color="transparent")
+        content_row = self.content_row
+        content_row.pack(fill="both", expand=True, padx=0, pady=14)
 
         self.wave_card = ctk.CTkFrame(content_row, fg_color=PANEL, corner_radius=14,
                                       border_width=1, border_color=BORDER)
@@ -1206,9 +1227,9 @@ class AutoCutApp(_BaseClass):
             self.wave_widget.dnd_bind("<<Drop>>", self._on_drop)
 
         # ── Controls ──────────────────────────────────────────────────────────
-        controls_card = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14,
+        controls_card = ctk.CTkFrame(self.editor_tab, fg_color=PANEL, corner_radius=14,
                                      border_width=1, border_color=BORDER)
-        controls_card.pack(fill="x", padx=20, pady=(0, 6))
+        controls_card.pack(fill="x", padx=0, pady=(0, 6))
 
         inner = ctk.CTkFrame(controls_card, fg_color="transparent")
         inner.pack(fill="x", padx=20, pady=(16, 8))
@@ -1298,9 +1319,9 @@ class AutoCutApp(_BaseClass):
         ).pack(side="left")
 
         # ── Footer ────────────────────────────────────────────────────────────
-        footer = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14,
+        footer = ctk.CTkFrame(self.editor_tab, fg_color=PANEL, corner_radius=14,
                               border_width=1, border_color=BORDER)
-        footer.pack(fill="x", padx=20, pady=(0, 18))
+        footer.pack(fill="x", padx=0, pady=(0, 0))
 
         self.stats_label = ctk.CTkLabel(footer, text="Import a video to begin",
                                         font=("", 12), text_color=MUTED)
@@ -1355,6 +1376,61 @@ class AutoCutApp(_BaseClass):
             command=self._undo, state="disabled"
         )
         self.undo_btn.pack(side="right", padx=(0, 4), pady=14)
+
+    def _build_support_tab(self, parent):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        support_card = ctk.CTkFrame(
+            parent, fg_color=PANEL, corner_radius=14,
+            border_width=1, border_color=BORDER
+        )
+        support_card.grid(row=0, column=0, sticky="nsew", padx=0, pady=14)
+
+        inner = ctk.CTkFrame(support_card, fg_color="transparent")
+        inner.pack(expand=True, padx=28, pady=28)
+
+        ctk.CTkLabel(
+            inner, text="Support", font=("", 20, "bold"), text_color=TEXT
+        ).pack(pady=(0, 8))
+
+        ctk.CTkLabel(
+            inner, text=SUPPORT_HANDLE, font=("", 15, "bold"), text_color=ACCENT
+        ).pack(pady=(0, 14))
+
+        ctk.CTkButton(
+            inner,
+            text="◎",
+            width=56,
+            height=48,
+            corner_radius=8,
+            font=("", 24, "bold"),
+            fg_color=PRIMARY,
+            hover_color="#1e293b",
+            command=self._open_support_instagram,
+        ).pack(pady=(0, 8))
+
+        ctk.CTkLabel(
+            inner,
+            text="Instagram",
+            font=("", 12),
+            text_color=MUTED,
+        ).pack(pady=(0, 24))
+
+        ctk.CTkLabel(
+            inner,
+            text=(
+                "For inquiries: I am a robotics, automation, AI, and software "
+                "engineer. This project is just for fun."
+            ),
+            font=("", 13),
+            text_color=TEXT,
+            wraplength=560,
+            justify="center",
+        ).pack()
+
+    def _open_support_instagram(self):
+        _open_with_system(SUPPORT_INSTAGRAM_URL)
 
     def _slider_col(self, parent, col, title, var, lo, hi, fmt):
         frame = ctk.CTkFrame(parent, fg_color="transparent")
@@ -1815,14 +1891,9 @@ class AutoCutApp(_BaseClass):
                 self.batch_listbox.insert(tk.END, Path(p).name)
 
         if self.batch_files:
-            self.batch_frame.pack(fill="x", padx=20, pady=(8, 0), after=self._get_header_widget())
-
-    def _get_header_widget(self):
-        # Return the header frame (first child of self that is a CTkFrame)
-        for child in self.winfo_children():
-            if isinstance(child, ctk.CTkFrame):
-                return child
-        return None
+            self.batch_frame.pack(
+                fill="x", padx=0, pady=(8, 0), before=self.content_row
+            )
 
     def _on_batch_select(self, event):
         sel = self.batch_listbox.curselection()
