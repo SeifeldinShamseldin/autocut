@@ -39,18 +39,22 @@ except ImportError as exc:
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
 
-# Light palette — B2B Professional
-BG       = "#F1F5F9"
-PANEL    = "#FFFFFF"
-BORDER   = "#E2E8F0"
-TEXT     = "#0F172A"
-MUTED    = "#64748B"
-PRIMARY  = "#0F172A"
-ACCENT   = "#0369A1"
-KEEP     = "#0369A1"
-REMOVE   = "#F87171"
-WAVE     = "#0F172A"
-WAVE_BG  = "#F8FAFC"
+# Light palette — clean workspace
+BG           = "#F4F7FB"
+PANEL        = "#FFFFFF"
+BORDER       = "#DCE5EF"
+TEXT         = "#111827"
+MUTED        = "#667085"
+PRIMARY      = "#111827"
+PRIMARY_HOVER = "#0B1220"
+ACCENT       = "#2563EB"
+ACCENT_HOVER = "#1D4ED8"
+SOFT         = "#E8EEF5"
+SOFT_HOVER   = "#D8E2EC"
+KEEP         = "#0891B2"
+REMOVE       = "#F97066"
+WAVE         = "#111827"
+WAVE_BG      = "#FFFFFF"
 
 PRESETS_FILE = Path.home() / ".autocut_presets.json"
 SUPPORT_HANDLE = "seifeldin.shamseldin"
@@ -1093,45 +1097,56 @@ class AutoCutApp(_BaseClass):
 
     def _build_ui(self):
         # ── Header ────────────────────────────────────────────────────────────
-        header = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14,
-                              border_width=1, border_color=BORDER)
-        header.pack(fill="x", padx=20, pady=(18, 0))
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=28, pady=(20, 0))
 
         title_row = ctk.CTkFrame(header, fg_color="transparent")
-        title_row.pack(side="left", padx=20, pady=14)
-        ctk.CTkLabel(title_row, text="✂", font=("", 22), text_color=ACCENT).pack(side="left", padx=(0, 6))
-        ctk.CTkLabel(title_row, text="AutoCut", font=("", 20, "bold"), text_color=TEXT).pack(side="left")
+        title_row.pack(side="left", pady=8)
+        mark = ctk.CTkFrame(title_row, width=38, height=38, corner_radius=19, fg_color=SOFT)
+        mark.pack(side="left", padx=(0, 10))
+        mark.pack_propagate(False)
+        ctk.CTkLabel(mark, text="✂", font=("", 21), text_color=ACCENT).pack(expand=True)
+
+        title_stack = ctk.CTkFrame(title_row, fg_color="transparent")
+        title_stack.pack(side="left")
+        ctk.CTkLabel(
+            title_stack, text="AutoCut", font=("", 22, "bold"), text_color=TEXT
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            title_stack, text="Single-video silence editor",
+            font=("", 12), text_color=MUTED
+        ).pack(anchor="w")
 
         self.import_btn = ctk.CTkButton(
-            header, text="+ Import Video", width=145, height=36,
+            header, text="+ Import Video", width=140, height=38,
             corner_radius=8, font=("", 13, "bold"),
-            fg_color=PRIMARY, hover_color="#1e293b",
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
             command=self.import_video
         )
-        self.import_btn.pack(side="right", padx=(0, 16), pady=14)
+        self.import_btn.pack(side="right", padx=(0, 0), pady=8)
 
         self.remove_video_btn = ctk.CTkButton(
-            header, text="Remove Video", width=120, height=36,
+            header, text="Remove Video", width=120, height=38,
             corner_radius=8, font=("", 13, "bold"),
-            fg_color=BORDER, text_color=TEXT, hover_color="#CBD5E1",
+            fg_color=SOFT, text_color=TEXT, hover_color=SOFT_HOVER,
             command=self.remove_video, state="disabled"
         )
-        self.remove_video_btn.pack(side="right", padx=(0, 8), pady=14)
+        self.remove_video_btn.pack(side="right", padx=(0, 8), pady=8)
 
         self.file_label = ctk.CTkLabel(header, text="No file selected",
                                        font=("", 12), text_color=MUTED)
-        self.file_label.pack(side="right", padx=4)
+        self.file_label.pack(side="right", padx=(0, 14), pady=8)
 
         self.tab_view = ctk.CTkTabview(
             self,
             fg_color="transparent",
             segmented_button_selected_color=ACCENT,
-            segmented_button_selected_hover_color="#075985",
-            segmented_button_unselected_color=BORDER,
-            segmented_button_unselected_hover_color="#CBD5E1",
+            segmented_button_selected_hover_color=ACCENT_HOVER,
+            segmented_button_unselected_color=SOFT,
+            segmented_button_unselected_hover_color=SOFT_HOVER,
             text_color=TEXT,
         )
-        self.tab_view.pack(fill="both", expand=True, padx=20, pady=(12, 18))
+        self.tab_view.pack(fill="both", expand=True, padx=28, pady=(10, 20))
         self.editor_tab = self.tab_view.add("Editor")
         self.support_tab = self.tab_view.add("Support")
         self.tab_view.set("Editor")
@@ -1143,15 +1158,14 @@ class AutoCutApp(_BaseClass):
         # ── Content row: waveform (full width) ────────────────────────────
         self.content_row = ctk.CTkFrame(self.editor_tab, fg_color="transparent")
         content_row = self.content_row
-        content_row.pack(fill="both", expand=True, padx=0, pady=14)
+        content_row.pack(fill="both", expand=True, padx=0, pady=(12, 12))
 
-        self.wave_card = ctk.CTkFrame(content_row, fg_color=PANEL, corner_radius=14,
-                                      border_width=1, border_color=BORDER)
+        self.wave_card = ctk.CTkFrame(content_row, fg_color=PANEL, corner_radius=12)
         self.wave_card.pack(fill="both", expand=True)
 
         wave_header = ctk.CTkFrame(self.wave_card, fg_color="transparent")
-        wave_header.pack(fill="x", padx=16, pady=(12, 0))
-        ctk.CTkLabel(wave_header, text="Audio Waveform", font=("", 12, "bold"),
+        wave_header.pack(fill="x", padx=18, pady=(14, 0))
+        ctk.CTkLabel(wave_header, text="Waveform", font=("", 13, "bold"),
                      text_color=TEXT).pack(side="left")
 
         # Playback position label
@@ -1174,7 +1188,7 @@ class AutoCutApp(_BaseClass):
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.wave_card)
         self.wave_widget = self.canvas.get_tk_widget()
-        self.wave_widget.pack(fill="both", expand=True, padx=12, pady=(6, 12))
+        self.wave_widget.pack(fill="both", expand=True, padx=14, pady=(8, 14))
 
         self._draw_empty_waveform()
         self.fig.canvas.mpl_connect("button_press_event", self._on_waveform_click)
@@ -1187,12 +1201,11 @@ class AutoCutApp(_BaseClass):
             self.wave_widget.dnd_bind("<<Drop>>", self._on_drop)
 
         # ── Controls ──────────────────────────────────────────────────────────
-        controls_card = ctk.CTkFrame(self.editor_tab, fg_color=PANEL, corner_radius=14,
-                                     border_width=1, border_color=BORDER)
-        controls_card.pack(fill="x", padx=0, pady=(0, 6))
+        controls_card = ctk.CTkFrame(self.editor_tab, fg_color="transparent")
+        controls_card.pack(fill="x", padx=0, pady=(0, 4))
 
         inner = ctk.CTkFrame(controls_card, fg_color="transparent")
-        inner.pack(fill="x", padx=20, pady=(16, 8))
+        inner.pack(fill="x", padx=0, pady=(2, 8))
         inner.columnconfigure((0, 1, 2, 3), weight=1)
 
         self.threshold_var   = ctk.DoubleVar(value=-40)
@@ -1217,9 +1230,9 @@ class AutoCutApp(_BaseClass):
             command=self._on_silence_mode_change,
             font=("", 12),
             selected_color=ACCENT,
-            selected_hover_color="#075985",
-            unselected_color=BORDER,
-            unselected_hover_color="#CBD5E1",
+            selected_hover_color=ACCENT_HOVER,
+            unselected_color=SOFT,
+            unselected_hover_color=SOFT_HOVER,
             text_color=TEXT,
             text_color_disabled=MUTED,
         )
@@ -1227,7 +1240,7 @@ class AutoCutApp(_BaseClass):
 
         # ── Settings row ──────────────────────────────────────────────────────
         settings_row = ctk.CTkFrame(controls_card, fg_color="transparent")
-        settings_row.pack(fill="x", padx=20, pady=(0, 14))
+        settings_row.pack(fill="x", padx=0, pady=(0, 10))
 
         ctk.CTkLabel(settings_row, text="Format:", font=("", 11), text_color=MUTED).pack(side="left")
         self.format_var = ctk.StringVar(value="MP4")
@@ -1235,8 +1248,8 @@ class AutoCutApp(_BaseClass):
             settings_row, variable=self.format_var,
             values=["MP4", "MOV"],
             width=80, height=28, font=("", 11),
-            fg_color=BORDER, text_color=TEXT,
-            button_color=BORDER, button_hover_color="#CBD5E1",
+            fg_color=SOFT, text_color=TEXT,
+            button_color=SOFT, button_hover_color=SOFT_HOVER,
             dropdown_fg_color=PANEL, dropdown_text_color=TEXT,
         ).pack(side="left", padx=(4, 14))
 
@@ -1246,8 +1259,8 @@ class AutoCutApp(_BaseClass):
             settings_row, variable=self.quality_var,
             values=["High CRF18", "Medium CRF23", "Low CRF28"],
             width=130, height=28, font=("", 11),
-            fg_color=BORDER, text_color=TEXT,
-            button_color=BORDER, button_hover_color="#CBD5E1",
+            fg_color=SOFT, text_color=TEXT,
+            button_color=SOFT, button_hover_color=SOFT_HOVER,
             dropdown_fg_color=PANEL, dropdown_text_color=TEXT,
         ).pack(side="left", padx=(4, 20))
 
@@ -1257,8 +1270,8 @@ class AutoCutApp(_BaseClass):
             settings_row, variable=self._preset_names_var,
             values=self._preset_menu_values(),
             width=130, height=28, font=("", 11),
-            fg_color=BORDER, text_color=TEXT,
-            button_color=BORDER, button_hover_color="#CBD5E1",
+            fg_color=SOFT, text_color=TEXT,
+            button_color=SOFT, button_hover_color=SOFT_HOVER,
             dropdown_fg_color=PANEL, dropdown_text_color=TEXT,
             command=self._load_preset,
         )
@@ -1267,20 +1280,19 @@ class AutoCutApp(_BaseClass):
         ctk.CTkButton(
             settings_row, text="Save", width=60, height=28,
             corner_radius=6, font=("", 11),
-            fg_color=ACCENT, hover_color="#075985",
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
             command=self._save_preset
         ).pack(side="left", padx=(0, 4))
 
         ctk.CTkButton(
             settings_row, text="Delete", width=65, height=28,
             corner_radius=6, font=("", 11),
-            fg_color=BORDER, text_color=TEXT, hover_color="#CBD5E1",
+            fg_color=SOFT, text_color=TEXT, hover_color=SOFT_HOVER,
             command=self._delete_preset
         ).pack(side="left")
 
         # ── Footer ────────────────────────────────────────────────────────────
-        footer = ctk.CTkFrame(self.editor_tab, fg_color=PANEL, corner_radius=14,
-                              border_width=1, border_color=BORDER)
+        footer = ctk.CTkFrame(self.editor_tab, fg_color="transparent")
         footer.pack(fill="x", padx=0, pady=(0, 0))
 
         self.stats_label = ctk.CTkLabel(footer, text="Import a video to begin",
@@ -1289,7 +1301,7 @@ class AutoCutApp(_BaseClass):
 
         # Progress bar (right side)
         self.progress = ctk.CTkProgressBar(footer, width=160, height=6,
-                                           corner_radius=3, fg_color=BORDER,
+                                           corner_radius=3, fg_color=SOFT,
                                            progress_color=ACCENT)
         self.progress.set(0)
         self.progress_shown = False
@@ -1298,7 +1310,7 @@ class AutoCutApp(_BaseClass):
         self.export_btn = ctk.CTkButton(
             footer, text="Export as One", width=145, height=36,
             corner_radius=8, font=("", 13, "bold"),
-            fg_color=PRIMARY, hover_color="#1e293b",
+            fg_color=PRIMARY, hover_color=PRIMARY_HOVER,
             command=self.export_video, state="disabled"
         )
         self.export_btn.pack(side="right", padx=(0, 16), pady=14)
@@ -1307,7 +1319,7 @@ class AutoCutApp(_BaseClass):
         self.export_clips_btn = ctk.CTkButton(
             footer, text="Export as Clips", width=145, height=36,
             corner_radius=8, font=("", 13, "bold"),
-            fg_color=ACCENT, hover_color="#075985",
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
             command=self.export_clips, state="disabled"
         )
         self.export_clips_btn.pack(side="right", padx=(0, 8), pady=14)
@@ -1315,7 +1327,7 @@ class AutoCutApp(_BaseClass):
         self.preview_btn = ctk.CTkButton(
             footer, text="▶  Play", width=115, height=36,
             corner_radius=8, font=("", 13, "bold"),
-            fg_color=ACCENT, hover_color="#075985",
+            fg_color=ACCENT, hover_color=ACCENT_HOVER,
             command=self.preview_cut, state="disabled"
         )
         self.preview_btn.pack(side="right", padx=(0, 8), pady=14)
@@ -1324,7 +1336,7 @@ class AutoCutApp(_BaseClass):
         self.redo_btn = ctk.CTkButton(
             footer, text="↪", width=36, height=36,
             corner_radius=8, font=("", 16),
-            fg_color=BORDER, text_color=MUTED, hover_color="#CBD5E1",
+            fg_color=SOFT, text_color=MUTED, hover_color=SOFT_HOVER,
             command=self._redo, state="disabled"
         )
         self.redo_btn.pack(side="right", padx=(0, 4), pady=14)
@@ -1332,7 +1344,7 @@ class AutoCutApp(_BaseClass):
         self.undo_btn = ctk.CTkButton(
             footer, text="↩", width=36, height=36,
             corner_radius=8, font=("", 16),
-            fg_color=BORDER, text_color=MUTED, hover_color="#CBD5E1",
+            fg_color=SOFT, text_color=MUTED, hover_color=SOFT_HOVER,
             command=self._undo, state="disabled"
         )
         self.undo_btn.pack(side="right", padx=(0, 4), pady=14)
@@ -1341,10 +1353,7 @@ class AutoCutApp(_BaseClass):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(0, weight=1)
 
-        support_card = ctk.CTkFrame(
-            parent, fg_color=PANEL, corner_radius=14,
-            border_width=1, border_color=BORDER
-        )
+        support_card = ctk.CTkFrame(parent, fg_color="transparent")
         support_card.grid(row=0, column=0, sticky="nsew", padx=0, pady=14)
 
         inner = ctk.CTkFrame(support_card, fg_color="transparent")
@@ -1366,7 +1375,7 @@ class AutoCutApp(_BaseClass):
             corner_radius=8,
             font=("", 24, "bold"),
             fg_color=PRIMARY,
-            hover_color="#1e293b",
+            hover_color=PRIMARY_HOVER,
             command=self._open_support_instagram,
         ).pack(pady=(0, 8))
 
@@ -1409,8 +1418,8 @@ class AutoCutApp(_BaseClass):
         var.trace_add("write", lambda *_: val_label.configure(text=fmt.format(var.get())))
 
         ctk.CTkSlider(frame, from_=lo, to=hi, variable=var, command=on_change,
-                      button_color=ACCENT, button_hover_color="#075985",
-                      progress_color=ACCENT, fg_color=BORDER).pack(fill="x")
+                      button_color=ACCENT, button_hover_color=ACCENT_HOVER,
+                      progress_color=ACCENT, fg_color=SOFT).pack(fill="x")
 
     # ── WAVEFORM ──────────────────────────────────────────────────────────────
 
