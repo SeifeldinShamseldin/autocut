@@ -14,6 +14,7 @@ pyinstaller \
   --onedir \
   --windowed \
   --collect-data tkinterdnd2 \
+  --add-data "assets:assets" \
   --name "AutoCut" \
   main.py
 

@@ -8,6 +8,7 @@ import platform
 import time as _time
 import queue as _queue
 import shutil
+import sys
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 import tkinter as tk
@@ -59,6 +60,7 @@ WAVE_BG      = "#FFFFFF"
 PRESETS_FILE = Path.home() / ".autocut_presets.json"
 SUPPORT_HANDLE = "seifeldin.shamseldin"
 SUPPORT_INSTAGRAM_URL = "https://www.instagram.com/seifeldin.shamseldin/"
+INSTAGRAM_LOGO_ASSET = ("assets", "instagram-logo.png")
 
 # Preview playback settings
 _PREVIEW_W   = 480
@@ -81,6 +83,11 @@ def _open_with_system(path: str):
         os.startfile(path)
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def _resource_path(*parts: str) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base.joinpath(*parts)
 
 
 def _fmt_time(seconds: float) -> str:
@@ -1367,15 +1374,17 @@ class AutoCutApp(_BaseClass):
             inner, text=SUPPORT_HANDLE, font=("", 15, "bold"), text_color=ACCENT
         ).pack(pady=(0, 14))
 
+        instagram_logo = self._load_instagram_logo()
         ctk.CTkButton(
             inner,
-            text="◎",
-            width=56,
-            height=48,
-            corner_radius=8,
-            font=("", 24, "bold"),
-            fg_color=PRIMARY,
-            hover_color=PRIMARY_HOVER,
+            text="" if instagram_logo else "Instagram",
+            image=instagram_logo,
+            width=76,
+            height=64,
+            corner_radius=14,
+            font=("", 13, "bold"),
+            fg_color=SOFT,
+            hover_color=SOFT_HOVER,
             command=self._open_support_instagram,
         ).pack(pady=(0, 8))
 
@@ -1400,6 +1409,19 @@ class AutoCutApp(_BaseClass):
 
     def _open_support_instagram(self):
         _open_with_system(SUPPORT_INSTAGRAM_URL)
+
+    def _load_instagram_logo(self):
+        try:
+            img = Image.open(_resource_path(*INSTAGRAM_LOGO_ASSET)).convert("RGBA")
+            self.instagram_logo_image = ctk.CTkImage(
+                light_image=img,
+                dark_image=img,
+                size=(46, 46),
+            )
+            return self.instagram_logo_image
+        except Exception:
+            self.instagram_logo_image = None
+            return None
 
     def _slider_col(self, parent, col, title, var, lo, hi, fmt):
         frame = ctk.CTkFrame(parent, fg_color="transparent")

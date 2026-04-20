@@ -8,7 +8,7 @@ echo Installing dependencies...
 pip install -r requirements.txt pyinstaller
 
 echo Building AutoCut.exe...
-pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --name "AutoCut" main.py
+pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --add-data "assets;assets" --name "AutoCut" main.py
 
 REM ── Try to build installer with Inno Setup ──
 where iscc >nul 2>&1

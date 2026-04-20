@@ -21,7 +21,7 @@ jobs:
 
       - name: Build AutoCut.app
         run: |
-          pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --name "AutoCut" main.py
+          pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --add-data "assets:assets" --name "AutoCut" main.py
 
       - name: Create DMG
         run: |
@@ -50,7 +50,7 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
 
       - name: Build AutoCut.exe
-        run: pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --name "AutoCut" main.py
+        run: pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --add-data "assets;assets" --name "AutoCut" main.py
 
       - name: Create installer
         run: |

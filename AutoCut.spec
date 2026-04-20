@@ -3,12 +3,13 @@
 from PyInstaller.utils.hooks import collect_data_files
 
 tkinterdnd2_datas = collect_data_files('tkinterdnd2')
+asset_datas = [('assets', 'assets')]
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=tkinterdnd2_datas,
+    datas=tkinterdnd2_datas + asset_datas,
     hiddenimports=['tkinterdnd2'],
     hookspath=[],
     hooksconfig={},
