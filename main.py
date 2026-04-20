@@ -1121,6 +1121,14 @@ class AutoCutApp(_BaseClass):
         )
         self.batch_btn.pack(side="right", padx=(0, 8), pady=14)
 
+        self.remove_video_btn = ctk.CTkButton(
+            header, text="Remove Video", width=120, height=36,
+            corner_radius=8, font=("", 13, "bold"),
+            fg_color=BORDER, text_color=TEXT, hover_color="#CBD5E1",
+            command=self.remove_video, state="disabled"
+        )
+        self.remove_video_btn.pack(side="right", padx=(0, 8), pady=14)
+
         self.file_label = ctk.CTkLabel(header, text="No file selected",
                                        font=("", 12), text_color=MUTED)
         self.file_label.pack(side="right", padx=4)
@@ -1721,6 +1729,7 @@ class AutoCutApp(_BaseClass):
     def _load_single(self, path: str):
         self.video_path = path
         self.file_label.configure(text=Path(path).name, text_color=TEXT)
+        self.remove_video_btn.configure(state="normal")
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
         self.preview_btn.configure(state="disabled")
@@ -1730,29 +1739,76 @@ class AutoCutApp(_BaseClass):
         self._aud_paused_pos = 0.0
         threading.Thread(target=self._load_audio, daemon=True).start()
 
+    def remove_video(self):
+        self.video_path = None
+        self.audio = None
+        self.duration_ms = 0
+        self.segments = []
+        self.energy_db = None
+        self.wave_xs = None
+        self.wave_env = None
+        self._aud_path = None
+        self._aud_paused_pos = 0.0
+        self._aud_duration = 0
+        self._aud_stop()
+
+        tmp_audio = getattr(self, "_tmp_audio", None)
+        if tmp_audio:
+            try:
+                os.unlink(tmp_audio)
+            except Exception:
+                pass
+            self._tmp_audio = None
+
+        self.file_label.configure(text="No file selected", text_color=MUTED)
+        self.remove_video_btn.configure(state="disabled")
+        self.export_btn.configure(state="disabled")
+        self.export_clips_btn.configure(state="disabled")
+        self.preview_btn.configure(text="▶  Play", state="disabled")
+        self._pos_label.configure(text="0:00 / 0:00")
+        self.stats_label.configure(text="Import a video to begin")
+        self._show_progress(False)
+        self._draw_empty_waveform()
+
     def _load_audio(self):
+        source_path = self.video_path
+        if not source_path:
+            return
+
         try:
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
-            self._tmp_audio = tmp.name
+            tmp_audio_path = tmp.name
+            self._tmp_audio = tmp_audio_path
 
             subprocess.run(
                 [
-                    FFMPEG, "-y", "-i", self.video_path,
+                    FFMPEG, "-y", "-i", source_path,
                     "-vn", "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
-                    self._tmp_audio,
+                    tmp_audio_path,
                 ],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
 
-            self.audio = AudioSegment.from_wav(self._tmp_audio)
-            self.duration_ms = len(self.audio)
+            audio = AudioSegment.from_wav(tmp_audio_path)
+            if self.video_path != source_path:
+                try:
+                    os.unlink(tmp_audio_path)
+                except Exception:
+                    pass
+                if getattr(self, "_tmp_audio", None) == tmp_audio_path:
+                    self._tmp_audio = None
+                return
+
+            self.audio = audio
+            self.duration_ms = len(audio)
             self._compute_energy()
             self.after(0, self._analyze_and_draw)
         except Exception as exc:
-            self.after(0, lambda: self.stats_label.configure(text=f"Error: {exc}"))
+            if self.video_path == source_path:
+                self.after(0, lambda: self.stats_label.configure(text=f"Error: {exc}"))
 
     # ── DRAG & DROP ───────────────────────────────────────────────────────────
 
