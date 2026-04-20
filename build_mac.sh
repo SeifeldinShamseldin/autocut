@@ -6,13 +6,14 @@
 set -e
 
 echo "Installing dependencies..."
-pip3.11 install -q customtkinter moviepy pydub numpy matplotlib imageio-ffmpeg pyinstaller
+pip3.11 install -q -r requirements.txt pyinstaller
 
 echo "Building AutoCut.app ..."
 pyinstaller \
   --noconfirm \
   --onedir \
   --windowed \
+  --collect-data tkinterdnd2 \
   --name "AutoCut" \
   main.py
 

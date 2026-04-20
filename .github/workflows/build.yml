@@ -17,11 +17,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install customtkinter moviepy pydub numpy matplotlib imageio-ffmpeg pyinstaller
+        run: pip install -r requirements.txt pyinstaller
 
       - name: Build AutoCut.app
         run: |
-          pyinstaller --noconfirm --onedir --windowed --name "AutoCut" main.py
+          pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --name "AutoCut" main.py
 
       - name: Create DMG
         run: |
@@ -47,10 +47,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install customtkinter moviepy pydub numpy matplotlib imageio-ffmpeg pyinstaller
+        run: pip install -r requirements.txt pyinstaller
 
       - name: Build AutoCut.exe
-        run: pyinstaller --noconfirm --onedir --windowed --name "AutoCut" main.py
+        run: pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --name "AutoCut" main.py
 
       - name: Create installer
         run: |

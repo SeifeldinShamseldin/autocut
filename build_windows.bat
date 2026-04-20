@@ -5,10 +5,10 @@ REM  Produces AutoCut-Windows-Setup.exe installer
 REM ─────────────────────────────────────────────
 
 echo Installing dependencies...
-pip install customtkinter moviepy pydub numpy matplotlib imageio-ffmpeg pyinstaller
+pip install -r requirements.txt pyinstaller
 
 echo Building AutoCut.exe...
-pyinstaller --noconfirm --onedir --windowed --name "AutoCut" main.py
+pyinstaller --noconfirm --onedir --windowed --collect-data tkinterdnd2 --name "AutoCut" main.py
 
 REM ── Try to build installer with Inno Setup ──
 where iscc >nul 2>&1

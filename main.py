@@ -6,6 +6,8 @@ import re
 import json
 import platform
 import time as _time
+import queue as _queue
+import shutil
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog
 import tkinter as tk
@@ -29,8 +31,10 @@ from matplotlib.figure import Figure
 try:
     from tkinterdnd2 import TkinterDnD, DND_FILES
     _DND = True
-except ImportError:
+    _DND_IMPORT_ERROR = None
+except ImportError as exc:
     _DND = False
+    _DND_IMPORT_ERROR = exc
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
@@ -49,6 +53,11 @@ WAVE     = "#0F172A"
 WAVE_BG  = "#F8FAFC"
 
 PRESETS_FILE = Path.home() / ".autocut_presets.json"
+
+# Preview playback settings
+_PREVIEW_W   = 480
+_PREVIEW_H   = 270
+_PREVIEW_FPS = 25
 
 
 def _dot(parent, color: str, label: str) -> ctk.CTkFrame:
@@ -104,12 +113,34 @@ def _parse_drop_paths(data: str) -> list:
     return [p for p in paths if p]
 
 
+def _video_info_text(path: str) -> str:
+    try:
+        r = subprocess.run([FFMPEG, "-i", path], capture_output=True, text=True)
+        return " ".join(line.strip() for line in r.stderr.splitlines() if "Video:" in line).lower()
+    except Exception:
+        return ""
+
+
+def _is_hdr_video(path: str) -> bool:
+    text = _video_info_text(path)
+    return any(token in text for token in ("bt2020", "smpte2084", "arib-std-b67", "hlg"))
+
+
+def _hdr_to_sdr_filter() -> str:
+    return (
+        "zscale=t=linear:npl=100,format=gbrpf32le,"
+        "zscale=p=bt709,tonemap=tonemap=hable:desat=0,"
+        "zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+    )
+
+
 # ── VideoPlayer widget ─────────────────────────────────────────────────────────
 
 class VideoPlayer(ctk.CTkFrame):
     """Embedded video player widget using ffmpeg raw frame piping + PIL."""
 
-    def __init__(self, master, segments_getter=None, **kwargs):
+    def __init__(self, master, segments_getter=None, timeline_getter=None,
+                 position_callback=None, loading_callback=None, **kwargs):
         super().__init__(master, fg_color=PRIMARY, corner_radius=12, **kwargs)
 
         self._path: str | None = None
@@ -119,6 +150,18 @@ class VideoPlayer(ctk.CTkFrame):
         self._stop_event = threading.Event()
         self._photo = None  # keep reference to prevent GC
         self._segments_getter = segments_getter
+        self._timeline_getter = timeline_getter
+        self._position_callback = position_callback
+        self._audio_proc = None
+        self._audio_path = None
+        self._preview_cache_path = None
+        self._preview_cache_key = None
+        self._loading_callback = loading_callback
+        # Producer-consumer playback state
+        self._frame_q: _queue.Queue | None = None
+        self._display_job = None
+        self._play_photo = None   # reused PhotoImage for paste() updates
+        self._hdr_cache: dict[str, bool] = {}  # path → is_hdr
 
         # ── Canvas (video display) ─────────────────────────────────────────
         self._canvas = tk.Canvas(self, bg="black", highlightthickness=0)
@@ -175,13 +218,40 @@ class VideoPlayer(ctk.CTkFrame):
         # Show first frame in background
         threading.Thread(target=lambda: self._show_frame(0), daemon=True).start()
 
+    def refresh_timeline(self, reset_position: bool = False):
+        """Refresh preview duration after cut settings change."""
+        if not self._path:
+            return
+
+        timeline = self._get_timeline()
+        w = max(self._canvas.winfo_width(), 320)
+        h = max(self._canvas.winfo_height(), 200)
+        cache_key = self._make_preview_cache_key(timeline, w, h)
+        if cache_key != self._preview_cache_key:
+            self._clear_preview_cache()
+
+        preview_duration = self._timeline_duration(timeline)
+        if reset_position:
+            self._current_pos = 0.0
+        else:
+            self._current_pos = min(self._current_pos, preview_duration)
+
+        frac = self._current_pos / preview_duration if preview_duration > 0 else 0
+        self._update_ui(frac, self._current_pos, preview_duration)
+
+        if not self._playing:
+            source_pos = self._source_pos_for_output(self._current_pos, timeline)
+            threading.Thread(target=lambda: self._show_frame(source_pos), daemon=True).start()
+
     def unload(self):
         """Stop playback, clear canvas, show placeholder."""
         self._stop_playback()
+        self._clear_preview_cache()
         self._path = None
         self._duration = 0.0
         self._current_pos = 0.0
         self._photo = None
+        self._play_photo = None
         self._canvas.delete("all")
         w = max(self._canvas.winfo_width(), 320)
         h = max(self._canvas.winfo_height(), 200)
@@ -220,6 +290,59 @@ class VideoPlayer(ctk.CTkFrame):
             pass
         return 0.0
 
+    def _get_timeline(self) -> list[tuple[int, int, float]]:
+        """Return edited preview timeline as (source_start_ms, source_end_ms, speed)."""
+        raw = []
+        if self._timeline_getter:
+            raw = self._timeline_getter() or []
+        elif self._segments_getter:
+            raw = [(s, e, 1.0) for s, e in (self._segments_getter() or [])]
+
+        timeline: list[tuple[int, int, float]] = []
+        for item in raw:
+            if len(item) == 2:
+                s_ms, e_ms = item
+                speed = 1.0
+            else:
+                s_ms, e_ms, speed = item
+            if e_ms > s_ms and speed > 0:
+                timeline.append((int(s_ms), int(e_ms), float(speed)))
+
+        if not timeline and self._duration > 0:
+            timeline = [(0, int(self._duration * 1000), 1.0)]
+        return timeline
+
+    @staticmethod
+    def _timeline_duration(timeline: list[tuple[int, int, float]]) -> float:
+        return sum((e_ms - s_ms) / 1000 / speed for s_ms, e_ms, speed in timeline)
+
+    def _source_pos_for_output(self, output_pos_s: float,
+                               timeline: list[tuple[int, int, float]]) -> float:
+        if not timeline:
+            return 0.0
+
+        cursor = 0.0
+        for s_ms, e_ms, speed in timeline:
+            out_dur = (e_ms - s_ms) / 1000 / speed
+            if output_pos_s <= cursor + out_dur:
+                local_out = max(0.0, output_pos_s - cursor)
+                return min(e_ms / 1000, s_ms / 1000 + local_out * speed)
+            cursor += out_dur
+
+        return timeline[-1][1] / 1000
+
+    def _locate_output_position(self, output_pos_s: float,
+                                timeline: list[tuple[int, int, float]]):
+        cursor = 0.0
+        for idx, (s_ms, e_ms, speed) in enumerate(timeline):
+            out_dur = (e_ms - s_ms) / 1000 / speed
+            if output_pos_s <= cursor + out_dur or idx == len(timeline) - 1:
+                local_out = max(0.0, output_pos_s - cursor)
+                source_start_s = min(e_ms / 1000, s_ms / 1000 + local_out * speed)
+                return idx, source_start_s, cursor + local_out
+            cursor += out_dur
+        return 0, 0.0, 0.0
+
     def _show_frame(self, pos_s: float):
         """Render a single frame at pos_s (background thread)."""
         if not self._path:
@@ -232,10 +355,7 @@ class VideoPlayer(ctk.CTkFrame):
                 "-ss", f"{pos_s:.3f}",
                 "-i", self._path,
                 "-vframes", "1",
-                "-vf", (
-                    f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                    f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
-                ),
+                "-vf", self._still_frame_filter(w, h),
                 "-f", "rawvideo",
                 "-pix_fmt", "rgb24",
                 "pipe:1",
@@ -257,149 +377,658 @@ class VideoPlayer(ctk.CTkFrame):
         self._stop_event.clear()
         self._playing = True
         self._play_btn.configure(text="⏸")
-        threading.Thread(target=self._playback_loop, daemon=True).start()
+        self._frame_q = _queue.Queue(maxsize=12)
+        self._play_photo = None
+        threading.Thread(target=self._decode_frames, daemon=True).start()
+        self._display_job = self.after(int(1000 / _PREVIEW_FPS), self._display_frame)
 
     def _stop_playback(self):
         self._stop_event.set()
         self._playing = False
         self._play_btn.configure(text="▶")
+        self._stop_audio()
+        if self._display_job is not None:
+            self.after_cancel(self._display_job)
+            self._display_job = None
+        self._play_photo = None
 
-    def _playback_loop(self):
-        """Play through speech segments at 15 fps (background thread)."""
-        if not self._path:
-            self._playing = False
+    def _decode_frames(self):
+        """Background thread: stream all segments via a SINGLE ffmpeg process.
+        Uses concat demuxer with inpoint/outpoint — zero per-segment startup cost."""
+        W, H = _PREVIEW_W, _PREVIEW_H
+        frame_bytes = W * H * 3
+        fi = 1.0 / _PREVIEW_FPS
+
+        timeline = self._get_timeline()
+        preview_duration = self._timeline_duration(timeline)
+        if not timeline or preview_duration <= 0:
+            self._frame_q.put(None)
             return
 
-        w = max(self._canvas.winfo_width(), 320)
-        h = max(self._canvas.winfo_height(), 200)
-        frame_bytes = w * h * 3
-        fi = 1.0 / 15  # 15 fps
+        start_pos_s = min(self._current_pos, preview_duration)
+        seg_idx, source_start_s, output_cursor_s = self._locate_output_position(
+            start_pos_s, timeline
+        )
 
-        segs = self._segments_getter() if self._segments_getter else []
-        if not segs:
-            segs = [(0, int(self._duration * 1000))]
+        hdr_prefix = f"{_hdr_to_sdr_filter()}," if self._cached_is_hdr() else ""
+        scale_f = (
+            f"{hdr_prefix}"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=fast_bilinear,"
+            f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:black"
+        )
 
-        # Find the starting segment index based on current pos
-        start_pos_ms = self._current_pos * 1000
-        seg_start_idx = 0
-        for idx, (s_ms, e_ms) in enumerate(segs):
-            if e_ms > start_pos_ms:
-                seg_start_idx = idx
-                break
+        # Extract audio in parallel — video starts immediately
+        threading.Thread(
+            target=self._build_audio_and_play,
+            args=(timeline, start_pos_s),
+            daemon=True,
+        ).start()
 
-        proc = None
+        self.after(0, lambda: self._play_btn.configure(text="⏸"))
+
+        all_normal = all(spd == 1.0 for _, _, spd in timeline[seg_idx:])
+
+        if all_normal:
+            self._stream_concat(
+                timeline, seg_idx, source_start_s, output_cursor_s,
+                preview_duration, W, H, frame_bytes, scale_f, fi,
+            )
+        else:
+            self._stream_per_segment(
+                timeline, seg_idx, source_start_s, output_cursor_s,
+                preview_duration, W, H, frame_bytes, scale_f, fi,
+            )
+
         try:
-            for seg_idx in range(seg_start_idx, len(segs)):
-                if self._stop_event.is_set():
-                    break
+            self._frame_q.put(None, timeout=1.0)
+        except _queue.Full:
+            pass
 
-                s_ms, e_ms = segs[seg_idx]
-
-                if seg_idx == seg_start_idx:
-                    seg_start_s = max(self._current_pos, s_ms / 1000)
-                else:
-                    seg_start_s = s_ms / 1000
-
-                seg_end_s = e_ms / 1000
-                seg_dur_s = seg_end_s - seg_start_s
-                if seg_dur_s <= 0:
+    def _stream_concat(self, timeline, seg_idx, source_start_s, output_cursor_s,
+                       preview_duration, W, H, frame_bytes, scale_f, fi):
+        """One ffmpeg via concat demuxer — handles all segments with no startup gap."""
+        concat_f = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        try:
+            for idx in range(seg_idx, len(timeline)):
+                s_ms, e_ms, _ = timeline[idx]
+                seg_start = source_start_s if idx == seg_idx else s_ms / 1000
+                seg_end = e_ms / 1000
+                if seg_end <= seg_start:
                     continue
+                safe = self._path.replace("'", "\\'")
+                concat_f.write(f"file '{safe}'\n")
+                concat_f.write(f"inpoint {seg_start:.6f}\n")
+                concat_f.write(f"outpoint {seg_end:.6f}\n")
+            concat_f.close()
 
-                cmd = [
-                    FFMPEG,
-                    "-ss", f"{seg_start_s:.3f}",
-                    "-i", self._path,
-                    "-t", f"{seg_dur_s:.3f}",
-                    "-vf", (
-                        f"fps=15,scale={w}:{h}:force_original_aspect_ratio=decrease,"
-                        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
-                    ),
-                    "-f", "rawvideo",
-                    "-pix_fmt", "rgb24",
-                    "-an",
-                    "pipe:1",
-                ]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
+            cmd = [
+                FFMPEG,
+                "-hwaccel", "auto",
+                "-f", "concat", "-safe", "0", "-i", concat_f.name,
+                "-vf", f"{scale_f},fps={_PREVIEW_FPS}",
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-an",
+                "pipe:1",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            frame_count = 0
+            loop_start = _time.monotonic()
 
-                frame_count = 0
-                loop_start = _time.monotonic()
-
+            try:
                 while not self._stop_event.is_set():
                     raw = proc.stdout.read(frame_bytes)
                     if len(raw) < frame_bytes:
                         break
 
-                    img = Image.frombytes("RGB", (w, h), raw)
-                    photo = ImageTk.PhotoImage(img)
-                    self._photo = photo
-                    self.after(0, lambda p=photo: self._blit(p, w, h))
+                    frame_count += 1
+                    elapsed = _time.monotonic() - loop_start
+                    expected = (frame_count - 1) * fi
 
-                    pos = seg_start_s + frame_count * fi
-                    self._current_pos = pos
-                    frac = pos / self._duration if self._duration > 0 else 0
-                    self.after(0, lambda f=frac, t=pos: self._update_ui(f, t))
+                    if self._frame_q.full() and elapsed > expected + fi:
+                        continue
+
+                    img = Image.frombytes("RGB", (W, H), raw)
+                    pos = min(output_cursor_s + frame_count * fi, preview_duration)
+                    source_pos = self._source_pos_for_output(pos, timeline)
+                    frac = pos / preview_duration if preview_duration > 0 else 0
+
+                    try:
+                        self._frame_q.put(
+                            (img, frac, pos, preview_duration, source_pos),
+                            block=True, timeout=0.15,
+                        )
+                    except _queue.Full:
+                        pass
+
+                    sleep_dur = expected - (_time.monotonic() - loop_start)
+                    if sleep_dur > 0.003:
+                        _time.sleep(sleep_dur)
+            finally:
+                try:
+                    proc.terminate()
+                    proc.wait()
+                except Exception:
+                    pass
+        finally:
+            try:
+                os.unlink(concat_f.name)
+            except Exception:
+                pass
+
+    def _stream_per_segment(self, timeline, seg_idx, source_start_s, output_cursor_s,
+                             preview_duration, W, H, frame_bytes, scale_f, fi):
+        """Per-segment ffmpeg for speed-changed segments (2×/4×/8×)."""
+        output_pos_s = output_cursor_s
+
+        for idx in range(seg_idx, len(timeline)):
+            if self._stop_event.is_set():
+                break
+
+            s_ms, e_ms, speed = timeline[idx]
+            seg_start = source_start_s if idx == seg_idx else s_ms / 1000
+            seg_dur = e_ms / 1000 - seg_start
+            if seg_dur <= 0:
+                continue
+
+            if speed == 1.0:
+                vf = f"{scale_f},fps={_PREVIEW_FPS}"
+            else:
+                vf = f"setpts={1.0/speed:.6f}*PTS,{scale_f},fps={_PREVIEW_FPS}"
+
+            cmd = [
+                FFMPEG,
+                "-ss", f"{seg_start:.3f}",
+                "-i", self._path,
+                "-t", f"{seg_dur:.3f}",
+                "-vf", vf,
+                "-f", "rawvideo", "-pix_fmt", "rgb24", "-an",
+                "pipe:1",
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            loop_start = _time.monotonic()
+            frame_count = 0
+
+            try:
+                while not self._stop_event.is_set():
+                    raw = proc.stdout.read(frame_bytes)
+                    if len(raw) < frame_bytes:
+                        break
 
                     frame_count += 1
                     elapsed = _time.monotonic() - loop_start
-                    expected = frame_count * fi
-                    sleep_dur = expected - elapsed
-                    if sleep_dur > 0:
+                    expected = (frame_count - 1) * fi
+
+                    if self._frame_q.full() and elapsed > expected + fi:
+                        continue
+
+                    img = Image.frombytes("RGB", (W, H), raw)
+                    pos = min(output_pos_s + frame_count * fi, preview_duration)
+                    source_pos = self._source_pos_for_output(pos, timeline)
+                    frac = pos / preview_duration if preview_duration > 0 else 0
+
+                    try:
+                        self._frame_q.put(
+                            (img, frac, pos, preview_duration, source_pos),
+                            block=True, timeout=0.15,
+                        )
+                    except _queue.Full:
+                        pass
+
+                    sleep_dur = expected - (_time.monotonic() - loop_start)
+                    if sleep_dur > 0.003:
                         _time.sleep(sleep_dur)
-
-                proc.terminate()
-                proc.wait()
-                proc = None
-
-        except Exception:
-            pass
-        finally:
-            if proc is not None:
+            finally:
                 try:
                     proc.terminate()
                     proc.wait()
                 except Exception:
                     pass
 
-        if not self._stop_event.is_set():
-            # Playback finished naturally — reset to beginning
+            output_pos_s += seg_dur / speed
+
+    def _build_audio_and_play(self, timeline, start_pos_s: float):
+        """Background: build combined-cut audio file then play with afplay.
+        Runs in parallel to video decode — audio starts a moment after video."""
+        if platform.system() != "Darwin":
+            return
+        if self._stop_event.is_set():
+            return
+        try:
+            audio_filter = self._build_audio_preview_filter(
+                timeline, 0, timeline[0][0] / 1000
+            )
+            if not audio_filter:
+                return
+
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            cmd = [
+                FFMPEG, "-y",
+                "-i", self._path,
+                "-filter_complex", audio_filter,
+                "-map", "[outa]",
+                "-vn", "-ar", "44100", "-ac", "2",
+                tmp.name,
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0 or self._stop_event.is_set():
+                try:
+                    os.unlink(tmp.name)
+                except Exception:
+                    pass
+                return
+
+            audio_path = tmp.name
+
+            # Trim to start_pos_s if needed
+            if start_pos_s > 0.1:
+                tmp2 = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp2.close()
+                r2 = subprocess.run(
+                    [FFMPEG, "-y", "-ss", f"{start_pos_s:.3f}",
+                     "-i", audio_path, tmp2.name],
+                    capture_output=True, text=True,
+                )
+                try:
+                    os.unlink(audio_path)
+                except Exception:
+                    pass
+                if r2.returncode != 0:
+                    try:
+                        os.unlink(tmp2.name)
+                    except Exception:
+                        pass
+                    return
+                audio_path = tmp2.name
+
+            if self._stop_event.is_set():
+                try:
+                    os.unlink(audio_path)
+                except Exception:
+                    pass
+                return
+
+            self._audio_path = audio_path
+            self._audio_proc = subprocess.Popen(
+                ["afplay", audio_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            # Race condition guard: close may have happened during extraction
+            if self._stop_event.is_set():
+                self._stop_audio()
+        except Exception:
+            pass
+
+    def _display_frame(self):
+        """Main thread: pull one frame from queue and blit it."""
+        self._display_job = None
+        if self._stop_event.is_set():
+            return
+
+        try:
+            item = self._frame_q.get_nowait()
+        except (_queue.Empty, AttributeError):
+            # Queue empty — check back soon without blocking
+            self._display_job = self.after(12, self._display_frame)
+            return
+
+        if item is None:
+            # Decoder finished naturally
+            self._playing = False
+            self._play_photo = None
             self._current_pos = 0.0
-            self.after(0, self._on_ended)
+            self._on_ended()
+            return
 
-        self._playing = False
+        img, frac, pos, preview_duration, source_pos = item
+        self._current_pos = pos
 
-    def _update_ui(self, frac: float, pos_s: float):
+        cw = max(self._canvas.winfo_width(), _PREVIEW_W)
+        ch = max(self._canvas.winfo_height(), _PREVIEW_H)
+
+        if self._play_photo is None:
+            # First frame: create PhotoImage and canvas item
+            self._play_photo = ImageTk.PhotoImage(img)
+            self._photo = self._play_photo
+            self._canvas.delete("all")
+            self._canvas.create_image(cw // 2, ch // 2,
+                                       image=self._play_photo, anchor="center")
+        else:
+            # Subsequent frames: paste in-place (no Tk object allocation)
+            self._play_photo.paste(img)
+
+        self._update_ui(frac, pos, preview_duration, source_pos)
+
+        self._display_job = self.after(int(1000 / _PREVIEW_FPS), self._display_frame)
+
+    def _update_ui(self, frac: float, pos_s: float, duration_s: float | None = None,
+                   source_pos_s: float | None = None):
+        if duration_s is None:
+            duration_s = self._timeline_duration(self._get_timeline())
         self._scrubber.set(max(0.0, min(1.0, frac)))
         self._time_label.configure(
-            text=f"{_fmt_time(pos_s)} / {_fmt_time(self._duration)}"
+            text=f"{_fmt_time(pos_s)} / {_fmt_time(duration_s)}"
         )
+        if self._position_callback:
+            if source_pos_s is None:
+                source_pos_s = self._source_pos_for_output(pos_s, self._get_timeline())
+            self._position_callback(pos_s, source_pos_s)
 
     def _on_ended(self):
         self._play_btn.configure(text="▶")
         self._scrubber.set(0)
-        self._time_label.configure(text=f"0:00 / {_fmt_time(self._duration)}")
+        preview_duration = self._timeline_duration(self._get_timeline())
+        self._time_label.configure(text=f"0:00 / {_fmt_time(preview_duration)}")
         # Show first frame again
         if self._path:
-            threading.Thread(target=lambda: self._show_frame(0), daemon=True).start()
+            source_pos = self._source_pos_for_output(0.0, self._get_timeline())
+            threading.Thread(target=lambda: self._show_frame(source_pos), daemon=True).start()
 
     def _on_scrub(self, val):
         if not self._path or self._duration <= 0:
             return
-        pos = float(val) * self._duration
+        timeline = self._get_timeline()
+        preview_duration = self._timeline_duration(timeline)
+        pos = float(val) * preview_duration
         self._current_pos = pos
-        self._time_label.configure(
-            text=f"{_fmt_time(pos)} / {_fmt_time(self._duration)}"
-        )
+        self._time_label.configure(text=f"{_fmt_time(pos)} / {_fmt_time(preview_duration)}")
+        source_pos = self._source_pos_for_output(pos, timeline)
+        if self._position_callback:
+            self._position_callback(pos, source_pos)
         if not self._playing:
-            threading.Thread(target=lambda: self._show_frame(pos), daemon=True).start()
+            threading.Thread(target=lambda: self._show_frame(source_pos), daemon=True).start()
+
+    @staticmethod
+    def _atempo_chain(speed: float) -> str:
+        filters = []
+        remaining = speed
+        while remaining > 2.0:
+            filters.append("atempo=2.0")
+            remaining /= 2.0
+        filters.append(f"atempo={remaining:.6f}")
+        return ",".join(filters)
+
+    def _build_video_preview_filters(self, timeline, seg_start_idx, first_source_start_s, w, h):
+        filters = []
+        labels = []
+        for out_idx, seg_idx in enumerate(range(seg_start_idx, len(timeline))):
+            s_ms, e_ms, speed = timeline[seg_idx]
+            seg_start_s = first_source_start_s if out_idx == 0 else s_ms / 1000
+            seg_end_s = e_ms / 1000
+            input_dur_s = seg_end_s - seg_start_s
+            if input_dur_s <= 0:
+                continue
+
+            pts_factor = 1.0 / speed
+            label = f"v{out_idx}"
+            filters.append(
+                f"[0:v]trim=start={seg_start_s:.6f}:end={seg_end_s:.6f},"
+                f"setpts={pts_factor:.6f}*(PTS-STARTPTS)[{label}]"
+            )
+            labels.append(f"[{label}]")
+
+        if not labels:
+            return [], []
+
+        if len(labels) == 1:
+            filters.append(f"{labels[0]}{self._preview_frame_filter(w, h)}[outv]")
+        else:
+            filters.append(
+                f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[vcat];"
+                f"[vcat]{self._preview_frame_filter(w, h)}[outv]"
+            )
+        return filters, labels
+
+    def _cached_is_hdr(self) -> bool:
+        if not self._path:
+            return False
+        if self._path not in self._hdr_cache:
+            self._hdr_cache[self._path] = _is_hdr_video(self._path)
+        return self._hdr_cache[self._path]
+
+    def _preview_frame_filter(self, w: int, h: int) -> str:
+        chain = []
+        if self._cached_is_hdr():
+            chain.append(_hdr_to_sdr_filter())
+        chain.extend([
+            f"fps={_PREVIEW_FPS}",
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos",
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
+        ])
+        return ",".join(chain)
+
+    def _still_frame_filter(self, w: int, h: int, apply_hdr: bool = True) -> str:
+        chain = []
+        if apply_hdr and self._cached_is_hdr():
+            chain.append(_hdr_to_sdr_filter())
+        chain.extend([
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos",
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
+        ])
+        return ",".join(chain)
+
+    def _make_preview_cache_key(self, timeline, w: int | None = None, h: int | None = None):
+        try:
+            mtime = os.path.getmtime(self._path) if self._path else 0
+        except Exception:
+            mtime = 0
+        return (self._path, mtime, w, h, tuple(timeline))
+
+    def _clear_preview_cache(self):
+        self._stop_audio()
+        if self._preview_cache_path:
+            try:
+                os.unlink(self._preview_cache_path)
+            except Exception:
+                pass
+        self._preview_cache_path = None
+        self._preview_cache_key = None
+
+    def _notify_loading(self, text: str):
+        if self._loading_callback:
+            self.after(0, lambda t=text: self._loading_callback(t))
+
+    def _ensure_preview_cache(self, w: int, h: int, timeline):
+        cache_key = self._make_preview_cache_key(timeline, w, h)
+        if (
+            self._preview_cache_path
+            and self._preview_cache_key == cache_key
+            and os.path.exists(self._preview_cache_path)
+        ):
+            return self._preview_cache_path
+
+        self._clear_preview_cache()
+        if not timeline:
+            raise RuntimeError("No preview timeline")
+
+        # Build scale filter once using cached HDR check
+        hdr_prefix = f"{_hdr_to_sdr_filter()}," if self._cached_is_hdr() else ""
+        scale_f = (
+            f"{hdr_prefix}"
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease:flags=lanczos,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black"
+        )
+
+        tmp_dir = tempfile.mkdtemp()
+        segment_files: list[str] = []
+        out_path: str | None = None
+        n = len(timeline)
+
+        try:
+            for i, (s_ms, e_ms, speed) in enumerate(timeline):
+                if self._stop_event.is_set():
+                    raise RuntimeError("Stopped")
+
+                self._notify_loading(f"Building preview… {i+1}/{n}")
+
+                seg_start = s_ms / 1000
+                seg_dur = max((e_ms - s_ms) / 1000, 0.001)
+                seg_path = os.path.join(tmp_dir, f"seg_{i:04d}.mp4")
+
+                if speed == 1.0:
+                    cmd = [
+                        FFMPEG, "-y",
+                        "-ss", f"{seg_start:.3f}",
+                        "-i", self._path,
+                        "-t", f"{seg_dur:.3f}",
+                        "-vf", scale_f,
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+                        "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "96k",
+                        "-movflags", "+faststart",
+                        seg_path,
+                    ]
+                else:
+                    atempo = self._atempo_chain(speed)
+                    cmd = [
+                        FFMPEG, "-y",
+                        "-ss", f"{seg_start:.3f}",
+                        "-i", self._path,
+                        "-t", f"{seg_dur:.3f}",
+                        "-filter_complex",
+                        f"[0:v]setpts={1.0/speed:.6f}*PTS,{scale_f}[v];[0:a]{atempo}[a]",
+                        "-map", "[v]", "-map", "[a]",
+                        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+                        "-pix_fmt", "yuv420p",
+                        "-c:a", "aac", "-b:a", "96k",
+                        "-movflags", "+faststart",
+                        seg_path,
+                    ]
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise RuntimeError(r.stderr[-400:])
+                segment_files.append(seg_path)
+
+            self._notify_loading("Building preview… joining")
+
+            tmp_out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+            tmp_out.close()
+            out_path = tmp_out.name
+
+            if len(segment_files) == 1:
+                r = subprocess.run(
+                    [FFMPEG, "-y", "-i", segment_files[0], "-c", "copy",
+                     "-movflags", "+faststart", out_path],
+                    capture_output=True, text=True,
+                )
+            else:
+                concat_txt = os.path.join(tmp_dir, "concat.txt")
+                with open(concat_txt, "w") as f:
+                    for seg in segment_files:
+                        f.write(f"file '{seg}'\n")
+                r = subprocess.run(
+                    [FFMPEG, "-y", "-f", "concat", "-safe", "0",
+                     "-i", concat_txt, "-c", "copy",
+                     "-movflags", "+faststart", out_path],
+                    capture_output=True, text=True,
+                )
+
+            if r.returncode != 0:
+                try:
+                    os.unlink(out_path)
+                except Exception:
+                    pass
+                raise RuntimeError(r.stderr[-400:])
+
+            self._preview_cache_path = out_path
+            self._preview_cache_key = cache_key
+            self._notify_loading("")
+            return out_path
+
+        finally:
+            for seg in segment_files:
+                try:
+                    os.unlink(seg)
+                except Exception:
+                    pass
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    def _build_audio_preview_filter(self, timeline, seg_start_idx, first_source_start_s):
+        filters = []
+        labels = []
+        for out_idx, seg_idx in enumerate(range(seg_start_idx, len(timeline))):
+            s_ms, e_ms, speed = timeline[seg_idx]
+            seg_start_s = first_source_start_s if out_idx == 0 else s_ms / 1000
+            seg_end_s = e_ms / 1000
+            if seg_end_s <= seg_start_s:
+                continue
+
+            label = f"a{out_idx}"
+            chain = (
+                f"[0:a]atrim=start={seg_start_s:.6f}:end={seg_end_s:.6f},"
+                f"asetpts=PTS-STARTPTS"
+            )
+            if speed != 1.0:
+                chain += f",{self._atempo_chain(speed)}"
+            chain += f"[{label}]"
+            filters.append(chain)
+            labels.append(f"[{label}]")
+
+        if not labels:
+            return None
+        if len(labels) == 1:
+            filters.append(f"{labels[0]}anull[outa]")
+        else:
+            filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[outa]")
+        return ";".join(filters)
+
+    def _start_audio_preview(self, cache_path: str, start_pos_s: float):
+        self._stop_audio()
+        if platform.system() != "Darwin":
+            return
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        cmd = [
+            FFMPEG, "-y",
+            "-ss", f"{start_pos_s:.3f}",
+            "-i", cache_path,
+            "-vn",
+            "-ac", "2",
+            "-ar", "44100",
+            tmp.name,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+            return
+
+        self._audio_path = tmp.name
+        self._audio_proc = subprocess.Popen(
+            ["afplay", tmp.name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _stop_audio(self):
+        if self._audio_proc is not None:
+            try:
+                self._audio_proc.terminate()
+                self._audio_proc.wait(timeout=1)
+            except Exception:
+                try:
+                    self._audio_proc.kill()
+                except Exception:
+                    pass
+            self._audio_proc = None
+
+        if self._audio_path:
+            try:
+                os.unlink(self._audio_path)
+            except Exception:
+                pass
+            self._audio_path = None
 
 
-# ── Base class: either TkinterDnD.Tk or ctk.CTk ──────────────────────────────
+# ── Base class: CTk with optional tkinterdnd2 support ────────────────────────
 if _DND:
-    _BaseClass = TkinterDnD.Tk
+    class _BaseClass(ctk.CTk, TkinterDnD.DnDWrapper):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.TkdndVersion = TkinterDnD._require(self)
 else:
     _BaseClass = ctk.CTk
 
@@ -407,11 +1036,6 @@ else:
 class AutoCutApp(_BaseClass):
     def __init__(self):
         super().__init__()
-
-        # When using TkinterDnD base, we need to set CTk appearance manually
-        if _DND:
-            ctk.set_appearance_mode("light")
-            ctk.set_default_color_theme("blue")
 
         self.title("AutoCut")
         self.geometry("1200x800")
@@ -428,6 +1052,18 @@ class AutoCutApp(_BaseClass):
         self.chunk_ms = 20
         self.wave_xs: np.ndarray | None = None
         self.wave_env: np.ndarray | None = None
+        self._wave_playhead = None
+        self._wave_playhead_label = None
+
+        # Audio-only preview state
+        self._aud_path: str | None = None     # pre-built cut audio WAV
+        self._aud_proc = None                  # afplay subprocess
+        self._aud_playing = False
+        self._aud_start_mono: float = 0        # monotonic when play started
+        self._aud_start_pos: float = 0         # audio offset when play started
+        self._aud_duration: float = 0
+        self._aud_tick_job = None
+        self._aud_paused_pos: float = 0.0      # position saved on pause
 
         # Undo/redo history: list of (threshold, min_silence, padding)
         self._history: list[tuple[float, float, float]] = []
@@ -443,14 +1079,16 @@ class AutoCutApp(_BaseClass):
 
         self._build_ui()
         self._bind_undo_redo()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Register drag-and-drop on entire window
         if _DND:
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", self._on_drop)
-            # Also register on the video canvas after UI is built
-            self.video_player._canvas.drop_target_register(DND_FILES)
-            self.video_player._canvas.dnd_bind("<<Drop>>", self._on_drop)
+        elif _DND_IMPORT_ERROR:
+            self.stats_label.configure(
+                text="Import a video to begin (drag-and-drop unavailable: tkinterdnd2 not installed)"
+            )
 
     # ── UI BUILD ──────────────────────────────────────────────────────────────
 
@@ -522,37 +1160,30 @@ class AutoCutApp(_BaseClass):
         self.batch_listbox.pack(fill="x", pady=(4, 0))
         self.batch_listbox.bind("<<ListboxSelect>>", self._on_batch_select)
 
-        # ── Content row: video player (left) + waveform (right) ───────────
+        # ── Content row: waveform (full width) ────────────────────────────
         content_row = ctk.CTkFrame(self, fg_color="transparent")
         content_row.pack(fill="both", expand=True, padx=20, pady=14)
 
-        # Video card (left)
-        video_card = ctk.CTkFrame(content_row, fg_color=PANEL, corner_radius=14,
-                                  border_width=1, border_color=BORDER, width=500)
-        video_card.pack(side="left", fill="y")
-        video_card.pack_propagate(False)
-
-        self.video_player = VideoPlayer(
-            video_card,
-            segments_getter=lambda: self.segments,
-        )
-        self.video_player.pack(fill="both", expand=True, padx=2, pady=2)
-
-        # Wave card (right)
         self.wave_card = ctk.CTkFrame(content_row, fg_color=PANEL, corner_radius=14,
                                       border_width=1, border_color=BORDER)
-        self.wave_card.pack(side="left", fill="both", expand=True, padx=(14, 0))
+        self.wave_card.pack(fill="both", expand=True)
 
         wave_header = ctk.CTkFrame(self.wave_card, fg_color="transparent")
         wave_header.pack(fill="x", padx=16, pady=(12, 0))
         ctk.CTkLabel(wave_header, text="Audio Waveform", font=("", 12, "bold"),
                      text_color=TEXT).pack(side="left")
+
+        # Playback position label
+        self._pos_label = ctk.CTkLabel(wave_header, text="0:00 / 0:00",
+                                       font=("", 11), text_color=MUTED)
+        self._pos_label.pack(side="left", padx=16)
+
         legend = ctk.CTkFrame(wave_header, fg_color="transparent")
         legend.pack(side="right")
         _dot(legend, KEEP, "Keep").pack(side="left", padx=8)
         _dot(legend, REMOVE, "Remove").pack(side="left", padx=(0, 4))
 
-        self.fig = Figure(figsize=(9, 2.8), dpi=100, facecolor=WAVE_BG)
+        self.fig = Figure(figsize=(9, 4.0), dpi=100, facecolor=WAVE_BG)
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor(WAVE_BG)
         self.ax.tick_params(colors=MUTED, labelsize=7)
@@ -565,6 +1196,7 @@ class AutoCutApp(_BaseClass):
         self.wave_widget.pack(fill="both", expand=True, padx=12, pady=(6, 12))
 
         self._draw_empty_waveform()
+        self.fig.canvas.mpl_connect("button_press_event", self._on_waveform_click)
 
         # Drag-and-drop bindings on waveform
         if _DND:
@@ -699,6 +1331,14 @@ class AutoCutApp(_BaseClass):
         )
         self.export_clips_btn.pack(side="right", padx=(0, 8), pady=14)
 
+        self.preview_btn = ctk.CTkButton(
+            footer, text="▶  Play", width=115, height=36,
+            corner_radius=8, font=("", 13, "bold"),
+            fg_color=ACCENT, hover_color="#075985",
+            command=self.preview_cut, state="disabled"
+        )
+        self.preview_btn.pack(side="right", padx=(0, 8), pady=14)
+
         # Undo/redo buttons
         self.redo_btn = ctk.CTkButton(
             footer, text="↪", width=36, height=36,
@@ -730,6 +1370,8 @@ class AutoCutApp(_BaseClass):
             val_label.configure(text=fmt.format(var.get()))
             self._debounced_update()
 
+        var.trace_add("write", lambda *_: val_label.configure(text=fmt.format(var.get())))
+
         ctk.CTkSlider(frame, from_=lo, to=hi, variable=var, command=on_change,
                       button_color=ACCENT, button_hover_color="#075985",
                       progress_color=ACCENT, fg_color=BORDER).pack(fill="x")
@@ -748,6 +1390,8 @@ class AutoCutApp(_BaseClass):
         for sp in self.ax.spines.values():
             sp.set_edgecolor(BORDER)
         self.canvas.draw()
+        self._wave_playhead = None
+        self._wave_playhead_label = None
 
     def _draw_waveform(self):
         if self.wave_xs is None:
@@ -781,6 +1425,53 @@ class AutoCutApp(_BaseClass):
             sp.set_edgecolor(BORDER)
         self.fig.tight_layout(pad=1.4)
         self.canvas.draw()
+        self._wave_playhead = None
+        self._wave_playhead_label = None
+
+    def _on_preview_position(self, output_pos_s: float, source_pos_s: float):
+        now = _time.monotonic()
+        if now - self._last_playhead_draw < 0.08:
+            return
+        self._last_playhead_draw = now
+        self._set_waveform_playhead(source_pos_s, output_pos_s)
+
+    def _on_preview_loading(self, text: str):
+        """Called by VideoPlayer while building the preview cache."""
+        if text:
+            self.stats_label.configure(text=text)
+            if not self.progress_shown:
+                self._show_progress(True)
+            self.progress.configure(mode="indeterminate")
+            self.progress.start()
+        else:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self._show_progress(False)
+
+    def _set_waveform_playhead(self, source_pos_s: float, output_pos_s: float | None = None):
+        if self.wave_xs is None:
+            return
+
+        total_s = self.duration_ms / 1000 if self.duration_ms else 0.0
+        source_pos_s = max(0.0, min(source_pos_s, total_s))
+        label = _fmt_time(output_pos_s if output_pos_s is not None else source_pos_s)
+
+        if self._wave_playhead is None:
+            self._wave_playhead = self.ax.axvline(
+                source_pos_s, color="#111827", linewidth=1.4, alpha=0.95, zorder=10
+            )
+            self._wave_playhead_label = self.ax.text(
+                source_pos_s, 1.08, label,
+                ha="center", va="bottom", color="#111827", fontsize=8,
+                bbox={"boxstyle": "round,pad=0.2", "facecolor": PANEL, "edgecolor": BORDER},
+                zorder=11,
+            )
+        else:
+            self._wave_playhead.set_xdata([source_pos_s, source_pos_s])
+            if self._wave_playhead_label is not None:
+                self._wave_playhead_label.set_position((source_pos_s, 1.08))
+                self._wave_playhead_label.set_text(label)
+        self.canvas.draw_idle()
 
     # ── ANALYSIS ──────────────────────────────────────────────────────────────
 
@@ -875,17 +1566,22 @@ class AutoCutApp(_BaseClass):
 
         self.stats_label.configure(
             text=f"Keep {kept_ms/1000:.1f}s ({kept_pct:.0f}%)  ·  "
+                 f"Preview {self._preview_duration_ms()/1000:.1f}s  ·  "
                  f"Remove {removed_ms/1000:.1f}s  ·  {len(self.segments)} clips"
         )
         state = "normal" if self.segments else "disabled"
         self.export_btn.configure(state=state)
         self.export_clips_btn.configure(state=state)
+        self.preview_btn.configure(state=state)
         self._draw_waveform()
+        self._aud_path = None
+        self._aud_paused_pos = 0.0
 
     # ── SILENCE MODE ──────────────────────────────────────────────────────────
 
     def _on_silence_mode_change(self, value):
-        pass  # Segments stay the same; mode is used at export time
+        if self.energy_db is not None:
+            self._analyze_and_draw()
 
     def _get_silence_speed(self) -> float | None:
         """Returns None for Cut mode, or the speed multiplier."""
@@ -918,6 +1614,9 @@ class AutoCutApp(_BaseClass):
             result.append((prev_end, self.duration_ms, speed))
         return result
 
+    def _preview_duration_ms(self) -> float:
+        return sum((e - s) / speed for s, e, speed in self._build_all_segments())
+
     @staticmethod
     def _atempo_chain(speed: float) -> str:
         """Build chained atempo filter string for speeds > 2x."""
@@ -948,9 +1647,11 @@ class AutoCutApp(_BaseClass):
         self.file_label.configure(text=Path(path).name, text_color=TEXT)
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
+        self.preview_btn.configure(state="disabled")
         self.stats_label.configure(text="Loading audio…")
-        # Load into video player
-        self.video_player.load(path)
+        self._aud_stop()
+        self._aud_path = None
+        self._aud_paused_pos = 0.0
         threading.Thread(target=self._load_audio, daemon=True).start()
 
     def _load_audio(self):
@@ -994,6 +1695,13 @@ class AutoCutApp(_BaseClass):
         self.bind("<Control-y>", lambda e: self._redo())
         self.bind("<Command-z>", lambda e: self._undo())
         self.bind("<Command-Z>", lambda e: self._redo())  # Cmd+Shift+Z
+
+    def _on_close(self):
+        try:
+            self._aud_stop()
+        except Exception:
+            pass
+        self.destroy()
 
     def _push_history(self):
         state = (
@@ -1135,6 +1843,7 @@ class AutoCutApp(_BaseClass):
             return
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
+        self.preview_btn.configure(state="disabled")
         self._show_progress(True)
         self.stats_label.configure(text="Batch export starting…")
         threading.Thread(target=self._do_batch_export, args=(folder,), daemon=True).start()
@@ -1231,6 +1940,8 @@ class AutoCutApp(_BaseClass):
         try:
             rotate = self._get_rotation_for(video_path)
             video_enc = self._get_video_encoder_with_crf(crf, out_path)
+            video_filter_args = self._get_video_filter_args(video_path)
+            color_args = self._get_color_metadata_args(video_path)
             n = len(segs)
 
             for i, (s_ms, e_ms) in enumerate(segs):
@@ -1240,7 +1951,9 @@ class AutoCutApp(_BaseClass):
                     "-ss", f"{s_ms/1000:.3f}",
                     "-i", video_path,
                     "-t", f"{(e_ms-s_ms)/1000:.3f}",
+                    *video_filter_args,
                     *video_enc,
+                    *color_args,
                     "-c:a", "aac", "-b:a", "192k",
                     seg,
                 ], capture_output=True, text=True)
@@ -1252,6 +1965,7 @@ class AutoCutApp(_BaseClass):
                 r = subprocess.run([
                     FFMPEG, "-y", "-i", segment_files[0],
                     "-c", "copy", "-metadata:s:v:0", f"rotate={rotate}",
+                    "-movflags", "+faststart",
                     out_path,
                 ], capture_output=True, text=True)
             else:
@@ -1263,6 +1977,7 @@ class AutoCutApp(_BaseClass):
                     FFMPEG, "-y",
                     "-f", "concat", "-safe", "0", "-i", concat_txt,
                     "-c", "copy", "-metadata:s:v:0", f"rotate={rotate}",
+                    "-movflags", "+faststart",
                     out_path,
                 ], capture_output=True, text=True)
 
@@ -1297,10 +2012,46 @@ class AutoCutApp(_BaseClass):
         return self._get_video_encoder_with_crf(crf)
 
     def _get_video_encoder_with_crf(self, crf: int, out_path: str = "") -> list[str]:
-        r = subprocess.run([FFMPEG, "-encoders"], capture_output=True, text=True)
-        if "h264_videotoolbox" in r.stdout and not out_path.endswith(".mov"):
-            return ["-c:v", "h264_videotoolbox", "-q:v", "60", "-pix_fmt", "yuv420p"]
-        return ["-c:v", "libx264", "-preset", "fast", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+        return ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p"]
+
+    def _get_video_filter_args(self, path: str) -> list[str]:
+        if _is_hdr_video(path):
+            return ["-vf", _hdr_to_sdr_filter()]
+        return []
+
+    def _get_segment_video_filter(self, speed: float, path: str) -> str:
+        filters = [f"setpts={1.0 / speed:.6f}*PTS"]
+        if _is_hdr_video(path):
+            filters.append(_hdr_to_sdr_filter())
+        return ",".join(filters)
+
+    def _get_color_metadata_args(self, path: str) -> list[str]:
+        if _is_hdr_video(path):
+            return ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
+
+        text = _video_info_text(path)
+
+        args: list[str] = []
+        if "bt2020nc" in text:
+            args.extend(["-colorspace", "bt2020nc"])
+        elif "bt2020" in text:
+            args.extend(["-colorspace", "bt2020nc"])
+        elif "bt709" in text:
+            args.extend(["-colorspace", "bt709"])
+
+        if "bt2020" in text:
+            args.extend(["-color_primaries", "bt2020"])
+        elif "bt709" in text:
+            args.extend(["-color_primaries", "bt709"])
+
+        if "smpte2084" in text:
+            args.extend(["-color_trc", "smpte2084"])
+        elif "arib-std-b67" in text:
+            args.extend(["-color_trc", "arib-std-b67"])
+        elif "bt709" in text:
+            args.extend(["-color_trc", "bt709"])
+
+        return args
 
     def _get_rotation(self) -> str:
         return self._get_rotation_for(self.video_path)
@@ -1340,6 +2091,181 @@ class AutoCutApp(_BaseClass):
         proc.wait()
         return proc
 
+    def _restore_action_buttons(self):
+        state = "normal" if self.segments else "disabled"
+        self.export_btn.configure(state=state)
+        self.export_clips_btn.configure(state=state)
+        self.preview_btn.configure(state=state)
+
+    # ── AUDIO PREVIEW ─────────────────────────────────────────────────────────
+
+    def preview_cut(self):
+        """Toggle audio playback of the cut."""
+        if not self.segments:
+            return
+        if self._aud_playing:
+            # Save position then pause
+            self._aud_paused_pos = self._aud_start_pos + (_time.monotonic() - self._aud_start_mono)
+            self._aud_paused_pos = min(self._aud_paused_pos, self._aud_duration)
+            self._aud_stop()
+            return
+        # Resume from paused position if audio already built
+        if self._aud_path and os.path.exists(self._aud_path):
+            self._aud_start(self._aud_paused_pos, self._aud_duration)
+        else:
+            self._aud_paused_pos = 0.0
+            self.preview_btn.configure(text="Building…", state="disabled")
+            threading.Thread(target=self._aud_build_and_play, daemon=True).start()
+
+    def _aud_build_and_play(self, seek_pos: float = 0.0):
+        """Background: extract cut audio then start playback."""
+        if not self.segments:
+            return
+        try:
+            audio_filter = self._build_audio_filter_for_segments()
+            if not audio_filter:
+                return
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            r = subprocess.run(
+                [FFMPEG, "-y", "-i", self.video_path,
+                 "-filter_complex", audio_filter,
+                 "-map", "[outa]", "-vn", "-ar", "44100", "-ac", "2", tmp.name],
+                capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                self.after(0, lambda: self.preview_btn.configure(
+                    text="▶  Play", state="normal"))
+                return
+            self._aud_path = tmp.name
+            # Get duration
+            dur = self._aud_wav_duration(tmp.name)
+            self.after(0, lambda d=dur: self._aud_start(seek_pos, d))
+        except Exception:
+            self.after(0, lambda: self.preview_btn.configure(
+                text="▶  Play", state="normal"))
+
+    def _build_audio_filter_for_segments(self) -> str | None:
+        """Build atrim/asetpts filter_complex for all kept segments."""
+        filters, labels = [], []
+        for i, (s_ms, e_ms) in enumerate(self.segments):
+            s_s, e_s = s_ms / 1000, e_ms / 1000
+            filters.append(
+                f"[0:a]atrim=start={s_s:.6f}:end={e_s:.6f},"
+                f"asetpts=PTS-STARTPTS[a{i}]"
+            )
+            labels.append(f"[a{i}]")
+        if not labels:
+            return None
+        if len(labels) == 1:
+            filters.append(f"{labels[0]}anull[outa]")
+        else:
+            filters.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[outa]")
+        return ";".join(filters)
+
+    def _aud_wav_duration(self, path: str) -> float:
+        try:
+            r = subprocess.run([FFMPEG, "-i", path], capture_output=True, text=True)
+            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
+            if m:
+                return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        except Exception:
+            pass
+        return 0.0
+
+    def _aud_start(self, pos: float, duration: float):
+        """Main thread: start afplay from pos and kick off the tick loop."""
+        self._aud_stop()
+        if not self._aud_path or not os.path.exists(self._aud_path):
+            return
+        self._aud_duration = duration
+
+        # Trim WAV to start position (fast PCM copy)
+        if pos > 0.1:
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            r = subprocess.run(
+                [FFMPEG, "-y", "-ss", f"{pos:.3f}", "-i", self._aud_path, tmp.name],
+                capture_output=True, text=True,
+            )
+            play_path = tmp.name if r.returncode == 0 else self._aud_path
+        else:
+            play_path = self._aud_path
+
+        self._aud_proc = subprocess.Popen(
+            ["afplay", play_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        self._aud_playing = True
+        self._aud_start_mono = _time.monotonic()
+        self._aud_start_pos = pos
+        self.preview_btn.configure(text="⏸  Pause", state="normal")
+        self._aud_tick()
+
+    def _aud_stop(self):
+        if self._aud_tick_job:
+            self.after_cancel(self._aud_tick_job)
+            self._aud_tick_job = None
+        if self._aud_proc:
+            try:
+                self._aud_proc.terminate()
+                self._aud_proc.wait(timeout=0.5)
+            except Exception:
+                pass
+            self._aud_proc = None
+        self._aud_playing = False
+        self.preview_btn.configure(text="▶  Play", state="normal" if self.segments else "disabled")
+
+    def _aud_tick(self):
+        """Update waveform cursor every 50 ms."""
+        if not self._aud_playing:
+            return
+        if self._aud_proc and self._aud_proc.poll() is not None:
+            # afplay finished naturally
+            self._aud_stop()
+            self._set_waveform_playhead(0.0, 0.0)
+            self._pos_label.configure(text=f"0:00 / {_fmt_time(self._aud_duration)}")
+            return
+
+        elapsed = _time.monotonic() - self._aud_start_mono
+        out_pos = min(self._aud_start_pos + elapsed, self._aud_duration)
+        src_pos = self._aud_pos_to_source(out_pos)
+        self._set_waveform_playhead(src_pos, out_pos)
+        self._pos_label.configure(
+            text=f"{_fmt_time(out_pos)} / {_fmt_time(self._aud_duration)}"
+        )
+        self._aud_tick_job = self.after(50, self._aud_tick)
+
+    def _aud_pos_to_source(self, out_pos_s: float) -> float:
+        """Map output audio position → source video position."""
+        cursor = 0.0
+        for s_ms, e_ms in self.segments:
+            seg_dur = (e_ms - s_ms) / 1000
+            if out_pos_s <= cursor + seg_dur:
+                return s_ms / 1000 + (out_pos_s - cursor)
+            cursor += seg_dur
+        return self.duration_ms / 1000
+
+    def _on_waveform_click(self, event):
+        """Click on waveform → seek audio to that source position."""
+        if event.inaxes != self.ax or self.duration_ms == 0 or not self._aud_path:
+            return
+        src_pos = max(0.0, min(float(event.xdata), self.duration_ms / 1000))
+        # Map source position → output audio position
+        out_pos = 0.0
+        for s_ms, e_ms in self.segments:
+            s_s, e_s = s_ms / 1000, e_ms / 1000
+            if src_pos <= s_s:
+                break
+            if src_pos <= e_s:
+                out_pos += src_pos - s_s
+                break
+            out_pos += e_s - s_s
+        out_pos = min(out_pos, self._aud_duration)
+        self._set_waveform_playhead(src_pos, out_pos)
+        if self._aud_playing:
+            self._aud_stop()
+            self.after(50, lambda p=out_pos, d=self._aud_duration: self._aud_start(p, d))
+
     def export_clips(self):
         if not self.segments:
             return
@@ -1348,6 +2274,7 @@ class AutoCutApp(_BaseClass):
             return
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
+        self.preview_btn.configure(state="disabled")
         self._show_progress(True)
         self.progress.set(0)
         self.stats_label.configure(text="Exporting clips…")
@@ -1358,6 +2285,8 @@ class AutoCutApp(_BaseClass):
             stem = Path(self.video_path).stem
             rotate = self._get_rotation()
             video_enc = self._get_video_encoder()
+            video_filter_args = self._get_video_filter_args(self.video_path)
+            color_args = self._get_color_metadata_args(self.video_path)
             ext = self._get_extension()
             n = len(self.segments)
             total_s = self.duration_ms / 1000
@@ -1377,9 +2306,12 @@ class AutoCutApp(_BaseClass):
                     "-ss", f"{s_ms/1000:.3f}",
                     "-i", self.video_path,
                     "-t", f"{seg_dur:.3f}",
+                    *video_filter_args,
                     *video_enc,
+                    *color_args,
                     "-c:a", "aac", "-b:a", "192k",
                     "-metadata:s:v:0", f"rotate={rotate}",
+                    "-movflags", "+faststart",
                     out_path,
                 ]
                 proc = self._run_ffmpeg_with_progress(cmd, seg_dur, total_s, done_s, _cb)
@@ -1390,8 +2322,7 @@ class AutoCutApp(_BaseClass):
         except Exception as exc:
             msg = str(exc)
             self.after(0, lambda: self.stats_label.configure(text=f"Export failed: {msg}"))
-            self.after(0, lambda: self.export_btn.configure(state="normal"))
-            self.after(0, lambda: self.export_clips_btn.configure(state="normal"))
+            self.after(0, self._restore_action_buttons)
             self.after(0, lambda: self._show_progress(False))
 
     def export_video(self):
@@ -1411,6 +2342,7 @@ class AutoCutApp(_BaseClass):
 
         self.export_btn.configure(state="disabled")
         self.export_clips_btn.configure(state="disabled")
+        self.preview_btn.configure(state="disabled")
         self._show_progress(True)
         self.progress.set(0)
         self.stats_label.configure(text="Exporting… this may take a moment")
@@ -1420,19 +2352,25 @@ class AutoCutApp(_BaseClass):
 
     def _do_export_with_progress(self, out_path: str,
                                   all_segs: list[tuple[int, int, float]],
-                                  low_quality: bool = False):
+                                  low_quality: bool = False,
+                                  open_after: bool = False,
+                                  done_msg: str = "Export complete!"):
         tmp_dir = tempfile.mkdtemp()
         segment_files: list[str] = []
         concat_txt = None
         try:
             if not all_segs:
                 self.after(0, lambda: self.stats_label.configure(text="Nothing to export."))
+                self.after(0, self._restore_action_buttons)
+                self.after(0, lambda: self._show_progress(False))
                 return
 
             rotate    = self._get_rotation()
             crf       = 28 if low_quality else self._get_crf()
             video_enc = (["-c:v", "libx264", "-preset", "ultrafast", "-crf", "35", "-pix_fmt", "yuv420p"]
                          if low_quality else self._get_video_encoder())
+            color_args = self._get_color_metadata_args(self.video_path)
+            video_filter_args = self._get_video_filter_args(self.video_path)
             ext       = Path(out_path).suffix.lstrip(".")
             n         = len(all_segs)
             total_s   = self.duration_ms / 1000
@@ -1453,23 +2391,25 @@ class AutoCutApp(_BaseClass):
                         "-ss", f"{s_ms/1000:.3f}",
                         "-i", self.video_path,
                         "-t", f"{seg_dur_input:.3f}",
+                        *video_filter_args,
                         *video_enc,
+                        *color_args,
                         "-c:a", "aac", "-b:a", "192k",
                         seg,
                     ]
                 else:
                     # Speed up silence: setpts for video, atempo chain for audio
                     atempo = self._atempo_chain(speed)
-                    pts_factor = 1.0 / speed
                     cmd = [
                         FFMPEG, "-y",
                         "-ss", f"{s_ms/1000:.3f}",
                         "-i", self.video_path,
                         "-t", f"{seg_dur_input:.3f}",
                         "-filter_complex",
-                        f"[0:v]setpts={pts_factor:.6f}*PTS[v];[0:a]{atempo}[a]",
+                        f"[0:v]{self._get_segment_video_filter(speed, self.video_path)}[v];[0:a]{atempo}[a]",
                         "-map", "[v]", "-map", "[a]",
                         *video_enc,
+                        *color_args,
                         "-c:a", "aac", "-b:a", "192k",
                         seg,
                     ]
@@ -1496,6 +2436,7 @@ class AutoCutApp(_BaseClass):
                 r = subprocess.run([
                     FFMPEG, "-y", "-i", segment_files[0],
                     "-c", "copy", "-metadata:s:v:0", f"rotate={rotate}",
+                    "-movflags", "+faststart",
                     out_path,
                 ], capture_output=True, text=True)
             else:
@@ -1507,18 +2448,20 @@ class AutoCutApp(_BaseClass):
                     FFMPEG, "-y",
                     "-f", "concat", "-safe", "0", "-i", concat_txt,
                     "-c", "copy", "-metadata:s:v:0", f"rotate={rotate}",
+                    "-movflags", "+faststart",
                     out_path,
                 ], capture_output=True, text=True)
 
             if r.returncode != 0:
                 raise RuntimeError(r.stderr[-400:])
 
-            self.after(0, self._export_done)
+            if open_after:
+                self.after(0, lambda p=out_path: _open_with_system(p))
+            self.after(0, lambda m=done_msg: self._export_done(m))
         except Exception as exc:
             msg = str(exc)
             self.after(0, lambda: self.stats_label.configure(text=f"Export failed: {msg}"))
-            self.after(0, lambda: self.export_btn.configure(state="normal"))
-            self.after(0, lambda: self.export_clips_btn.configure(state="normal"))
+            self.after(0, self._restore_action_buttons)
             self.after(0, lambda: self._show_progress(False))
         finally:
             for seg in segment_files:
@@ -1534,8 +2477,7 @@ class AutoCutApp(_BaseClass):
         self._show_progress(False)
         self.progress.set(1)
         self.stats_label.configure(text=msg)
-        self.export_btn.configure(state="normal")
-        self.export_clips_btn.configure(state="normal")
+        self._restore_action_buttons()
 
     def _show_progress(self, show: bool):
         if show and not self.progress_shown:
