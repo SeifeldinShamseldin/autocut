@@ -1072,9 +1072,6 @@ class AutoCutApp(_BaseClass):
         self._history_idx: int = -1
         self._history_updating: bool = False
 
-        # Batch state
-        self.batch_files: list[str] = []
-
         # Presets
         self._presets: dict[str, dict] = {}
         self._load_presets_from_disk()
@@ -1113,14 +1110,6 @@ class AutoCutApp(_BaseClass):
         )
         self.import_btn.pack(side="right", padx=(0, 16), pady=14)
 
-        self.batch_btn = ctk.CTkButton(
-            header, text="+ Batch", width=100, height=36,
-            corner_radius=8, font=("", 13, "bold"),
-            fg_color="#7C3AED", hover_color="#6D28D9",
-            command=self._add_batch_files
-        )
-        self.batch_btn.pack(side="right", padx=(0, 8), pady=14)
-
         self.remove_video_btn = ctk.CTkButton(
             header, text="Remove Video", width=120, height=36,
             corner_radius=8, font=("", 13, "bold"),
@@ -1150,43 +1139,6 @@ class AutoCutApp(_BaseClass):
         self.support_tab.configure(fg_color="transparent")
 
         self._build_support_tab(self.support_tab)
-
-        # ── Batch file list (hidden until batch active) ────────────────────
-        self.batch_frame = ctk.CTkFrame(self.editor_tab, fg_color=PANEL, corner_radius=14,
-                                        border_width=1, border_color=BORDER)
-        # Not packed yet — shown only when batch_files is non-empty
-
-        batch_inner = ctk.CTkFrame(self.batch_frame, fg_color="transparent")
-        batch_inner.pack(fill="both", expand=True, padx=12, pady=8)
-
-        batch_title_row = ctk.CTkFrame(batch_inner, fg_color="transparent")
-        batch_title_row.pack(fill="x")
-        ctk.CTkLabel(batch_title_row, text="Batch Files", font=("", 12, "bold"),
-                     text_color=TEXT).pack(side="left")
-        self.export_all_btn = ctk.CTkButton(
-            batch_title_row, text="Export All", width=110, height=28,
-            corner_radius=6, font=("", 12, "bold"),
-            fg_color="#7C3AED", hover_color="#6D28D9",
-            command=self._export_all_batch
-        )
-        self.export_all_btn.pack(side="right")
-
-        clear_btn = ctk.CTkButton(
-            batch_title_row, text="Clear", width=70, height=28,
-            corner_radius=6, font=("", 12),
-            fg_color=BORDER, text_color=TEXT, hover_color="#CBD5E1",
-            command=self._clear_batch
-        )
-        clear_btn.pack(side="right", padx=(0, 6))
-
-        self.batch_listbox = tk.Listbox(
-            batch_inner, height=4, bg=WAVE_BG, fg=TEXT,
-            selectbackground=ACCENT, selectforeground=PANEL,
-            relief="flat", borderwidth=0, font=("", 11),
-            activestyle="none"
-        )
-        self.batch_listbox.pack(fill="x", pady=(4, 0))
-        self.batch_listbox.bind("<<ListboxSelect>>", self._on_batch_select)
 
         # ── Content row: waveform (full width) ────────────────────────────
         self.content_row = ctk.CTkFrame(self.editor_tab, fg_color="transparent")
@@ -1928,197 +1880,6 @@ class AutoCutApp(_BaseClass):
         del self._presets[name]
         self._save_presets_to_disk()
         self._refresh_preset_menu()
-
-    # ── BATCH PROCESSING ──────────────────────────────────────────────────────
-
-    def _add_batch_files(self):
-        paths = filedialog.askopenfilenames(
-            title="Select Videos for Batch",
-            filetypes=[
-                ("Video files", "*.mp4 *.mov *.avi *.mkv *.m4v *.webm"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not paths:
-            return
-        for p in paths:
-            if p not in self.batch_files:
-                self.batch_files.append(p)
-                self.batch_listbox.insert(tk.END, Path(p).name)
-
-        if self.batch_files:
-            self.batch_frame.pack(
-                fill="x", padx=0, pady=(8, 0), before=self.content_row
-            )
-
-    def _on_batch_select(self, event):
-        sel = self.batch_listbox.curselection()
-        if sel:
-            path = self.batch_files[sel[0]]
-            self._load_single(path)
-
-    def _clear_batch(self):
-        self.batch_files.clear()
-        self.batch_listbox.delete(0, tk.END)
-        self.batch_frame.pack_forget()
-
-    def _export_all_batch(self):
-        if not self.batch_files:
-            return
-        folder = filedialog.askdirectory(title="Choose folder to save batch exports")
-        if not folder:
-            return
-        self.export_btn.configure(state="disabled")
-        self.export_clips_btn.configure(state="disabled")
-        self.preview_btn.configure(state="disabled")
-        self._show_progress(True)
-        self.stats_label.configure(text="Batch export starting…")
-        threading.Thread(target=self._do_batch_export, args=(folder,), daemon=True).start()
-
-    def _do_batch_export(self, folder: str):
-        # Save current state
-        saved = (
-            self.video_path,
-            self.audio,
-            self.duration_ms,
-            self.energy_db,
-            self.segments,
-            self.wave_xs,
-            self.wave_env,
-        )
-
-        threshold  = self.threshold_var.get()
-        min_sil_ms = int(self.min_silence_var.get())
-        pad_ms     = int(self.padding_var.get())
-        fmt        = self.format_var.get().lower()
-        crf        = self._get_crf()
-
-        total = len(self.batch_files)
-        for idx, path in enumerate(self.batch_files):
-            try:
-                self.after(0, lambda i=idx, t=total: self.stats_label.configure(
-                    text=f"Batch: loading file {i+1}/{t}…"))
-
-                # Load audio for this file
-                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                tmp.close()
-                subprocess.run(
-                    [FFMPEG, "-y", "-i", path,
-                     "-vn", "-ar", "16000", "-ac", "1", "-sample_fmt", "s16",
-                     tmp.name],
-                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                audio = AudioSegment.from_wav(tmp.name)
-                duration_ms = len(audio)
-
-                # Compute energy
-                samples = np.array(audio.get_array_of_samples(), dtype=np.float32)
-                if audio.channels == 2:
-                    samples = samples.reshape(-1, 2).mean(axis=1)
-                sr = audio.frame_rate
-                chunk = max(1, int(sr * self.chunk_ms / 1000))
-                n = len(samples)
-                n_chunks = n // chunk
-                trimmed = samples[: n_chunks * chunk].reshape(n_chunks, chunk)
-                rms = np.sqrt((trimmed ** 2).mean(axis=1))
-                rms = np.maximum(rms, 1e-10)
-                energy_db = 20 * np.log10(rms / 32768.0)
-
-                segs = self._compute_segments_from_energy(
-                    energy_db, duration_ms, threshold, min_sil_ms, pad_ms
-                )
-
-                if not segs:
-                    continue
-
-                stem = Path(path).stem
-                out_path = os.path.join(folder, f"{stem}_autocut.{fmt}")
-
-                self.after(0, lambda i=idx, t=total: self.stats_label.configure(
-                    text=f"Batch: exporting file {i+1}/{t}…"))
-
-                self._export_one_file(path, segs, duration_ms, out_path, crf)
-
-                overall = (idx + 1) / total
-                self.after(0, lambda v=overall: self.progress.set(v))
-
-                try:
-                    os.unlink(tmp.name)
-                except Exception:
-                    pass
-
-            except Exception as exc:
-                msg = str(exc)
-                self.after(0, lambda m=msg, i=idx: self.stats_label.configure(
-                    text=f"Batch error on file {i+1}: {m}"))
-
-        # Restore state
-        (self.video_path, self.audio, self.duration_ms,
-         self.energy_db, self.segments, self.wave_xs, self.wave_env) = saved
-
-        self.after(0, lambda: self._export_done(f"Batch export complete! {total} files."))
-
-    def _export_one_file(self, video_path: str, segs: list[tuple[int, int]],
-                          duration_ms: int, out_path: str, crf: int):
-        """Export a single file using concat demuxer. No progress callback (batch loop handles it)."""
-        tmp_dir = tempfile.mkdtemp()
-        segment_files: list[str] = []
-        concat_txt = None
-        try:
-            rotate = self._get_rotation_for(video_path)
-            video_enc = self._get_video_encoder_with_crf(crf, out_path)
-            video_filter_args = self._get_video_filter_args(video_path)
-            color_args = self._get_color_metadata_args(video_path)
-            n = len(segs)
-
-            for i, (s_ms, e_ms) in enumerate(segs):
-                seg = os.path.join(tmp_dir, f"seg_{i:04d}.mp4")
-                r = subprocess.run([
-                    FFMPEG, "-y",
-                    "-ss", f"{s_ms/1000:.3f}",
-                    "-i", video_path,
-                    "-t", f"{(e_ms-s_ms)/1000:.3f}",
-                    *video_filter_args,
-                    *video_enc,
-                    *color_args,
-                    "-c:a", "aac", "-b:a", "192k",
-                    seg,
-                ], capture_output=True, text=True)
-                if r.returncode != 0:
-                    raise RuntimeError(r.stderr[-400:])
-                segment_files.append(seg)
-
-            if len(segment_files) == 1:
-                r = subprocess.run([
-                    FFMPEG, "-y", "-i", segment_files[0],
-                    "-c", "copy", "-metadata:s:v:0", f"rotate={rotate}",
-                    "-movflags", "+faststart",
-                    out_path,
-                ], capture_output=True, text=True)
-            else:
-                concat_txt = os.path.join(tmp_dir, "concat.txt")
-                with open(concat_txt, "w") as f:
-                    for seg in segment_files:
-                        f.write(f"file '{seg}'\n")
-                r = subprocess.run([
-                    FFMPEG, "-y",
-                    "-f", "concat", "-safe", "0", "-i", concat_txt,
-                    "-c", "copy", "-metadata:s:v:0", f"rotate={rotate}",
-                    "-movflags", "+faststart",
-                    out_path,
-                ], capture_output=True, text=True)
-
-            if r.returncode != 0:
-                raise RuntimeError(r.stderr[-400:])
-        finally:
-            for seg in segment_files:
-                try: os.unlink(seg)
-                except: pass
-            if concat_txt:
-                try: os.unlink(concat_txt)
-                except: pass
-            try: os.rmdir(tmp_dir)
-            except: pass
 
     # ── EXPORT ────────────────────────────────────────────────────────────────
 
